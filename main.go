@@ -747,6 +747,9 @@ func (s *daemonServer) handleSessionPrompt(w http.ResponseWriter, r *http.Reques
 	s.totalSteps += len(result.Steps)
 	s.mu.Unlock()
 
+	// Persist usage and model so the console can display them after a browser refresh
+	s.sessions.UpdateUsage(sessionId, result.TotalUsage, usedModel, result.Steps)
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(promptResponse{Output: output, Model: usedModel})
 }
