@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"charm.land/fantasy"
 )
@@ -31,12 +32,14 @@ func newFEPEmitter(w http.ResponseWriter) *fepEmitter {
 	return &fepEmitter{w: w, f: f}
 }
 
-// emit writes a single SSE data frame: data: {"type":"<eventType>", ...fields}\n\n
+// emit writes a single SSE data frame: data: {"type":"<eventType>", "timestamp":"...", ...fields}\n\n
+// Every event gets a UTC RFC3339 timestamp automatically.
 func (e *fepEmitter) emit(eventType string, fields map[string]any) {
 	if fields == nil {
 		fields = make(map[string]any)
 	}
 	fields["type"] = eventType
+	fields["timestamp"] = time.Now().UTC().Format(time.RFC3339)
 
 	payload, err := json.Marshal(fields)
 	if err != nil {
