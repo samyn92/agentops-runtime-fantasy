@@ -550,13 +550,13 @@ func (s *daemonServer) generateTitle(sessionId, userPrompt string) {
 		temp := 0.3
 		var maxTok int64 = 25
 		titleAgent := fantasy.NewAgent(model,
-			fantasy.WithSystemPrompt("Title this chat in max 6 words. No quotes, no punctuation at the end."),
+			fantasy.WithSystemPrompt("You are a title generator. Given a user message, output ONLY a short title (max 6 words) that summarizes the topic. No explanation, no quotes, no punctuation at the end. Just the title words."),
 			fantasy.WithTemperature(temp),
 			fantasy.WithMaxOutputTokens(maxTok),
 		)
 
 		result, err := titleAgent.Generate(ctx, fantasy.AgentCall{
-			Prompt: userPrompt,
+			Prompt: fmt.Sprintf("Generate a title for this message: %s", userPrompt),
 		})
 		if err != nil {
 			slog.Warn("title generation: LLM call failed", "error", err)
@@ -564,6 +564,13 @@ func (s *daemonServer) generateTitle(sessionId, userPrompt string) {
 		}
 
 		title := strings.TrimSpace(result.Response.Content.Text())
+		if title == "" {
+			return
+		}
+		// Strip quotes and trailing punctuation the model might add
+		title = strings.Trim(title, `"'`)
+		title = strings.TrimRight(title, ".!?;:,")
+		title = strings.TrimSpace(title)
 		if title == "" {
 			return
 		}
