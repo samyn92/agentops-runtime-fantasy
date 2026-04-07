@@ -53,10 +53,12 @@ type sessionUsage struct {
 }
 
 // turnUsage stores token counts for a single agent call (one user prompt -> one agent response).
+// StepUsages contains per-step breakdown so each assistant message can show its own token count.
 type turnUsage struct {
-	Usage sessionUsage `json:"usage"`
-	Model string       `json:"model"`
-	Steps int          `json:"steps"`
+	Usage      sessionUsage   `json:"usage"`
+	Model      string         `json:"model"`
+	Steps      int            `json:"steps"`
+	StepUsages []sessionUsage `json:"step_usages,omitempty"`
 }
 
 // SessionInfo is the API-facing representation of a session (times as RFC3339).
@@ -475,30 +477,42 @@ func (ss *SessionStore) UpdateTitle(id string, title string) {
 }
 
 // UpdateUsage stores the total token usage and model for a session,
-// and appends a per-turn usage entry so each assistant message can show
-// its token count after a browser refresh.
+// and appends a per-turn usage entry (with per-step breakdown) so each
+// assistant message can show its own token count after a browser refresh.
 // Called after agent_finish so the data survives a browser refresh.
-func (ss *SessionStore) UpdateUsage(id string, usage fantasy.Usage, model string, steps int) {
+func (ss *SessionStore) UpdateUsage(id string, totalUsage fantasy.Usage, model string, stepResults []fantasy.StepResult) {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 	s, ok := ss.sessions[id]
 	if !ok {
 		return
 	}
-	u := sessionUsage{
-		InputTokens:         usage.InputTokens,
-		OutputTokens:        usage.OutputTokens,
-		TotalTokens:         usage.TotalTokens,
-		ReasoningTokens:     usage.ReasoningTokens,
-		CacheCreationTokens: usage.CacheCreationTokens,
-		CacheReadTokens:     usage.CacheReadTokens,
-	}
+	u := usageToSession(totalUsage)
 	s.TotalUsage = &u
 	s.Model = model
+
+	// Build per-step usage breakdown
+	stepUsages := make([]sessionUsage, len(stepResults))
+	for i, sr := range stepResults {
+		stepUsages[i] = usageToSession(sr.Usage)
+	}
+
 	s.TurnUsages = append(s.TurnUsages, turnUsage{
-		Usage: u,
-		Model: model,
-		Steps: steps,
+		Usage:      u,
+		Model:      model,
+		Steps:      len(stepResults),
+		StepUsages: stepUsages,
 	})
 	ss.persist(s)
+}
+
+func usageToSession(u fantasy.Usage) sessionUsage {
+	return sessionUsage{
+		InputTokens:         u.InputTokens,
+		OutputTokens:        u.OutputTokens,
+		TotalTokens:         u.TotalTokens,
+		ReasoningTokens:     u.ReasoningTokens,
+		CacheCreationTokens: u.CacheCreationTokens,
+		CacheReadTokens:     u.CacheReadTokens,
+	}
 }

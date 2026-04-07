@@ -998,7 +998,7 @@ func (s *daemonServer) handleSessionPromptStream(w http.ResponseWriter, r *http.
 		emit.emitAgentFinish(sessionId, result.TotalUsage, finalSteps, usedModel)
 
 		// Persist usage and model on the session so the console can display them after a browser refresh
-		s.sessions.UpdateUsage(sessionId, result.TotalUsage, usedModel, finalSteps)
+		s.sessions.UpdateUsage(sessionId, result.TotalUsage, usedModel, result.Steps)
 	}
 
 	// Emit idle
