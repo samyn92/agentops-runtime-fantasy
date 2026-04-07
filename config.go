@@ -13,6 +13,7 @@ type Config struct {
 	PrimaryProvider string          `json:"primaryProvider,omitempty"`
 	PrimaryModel    string          `json:"primaryModel"`
 	FallbackModels  []string        `json:"fallbackModels,omitempty"`
+	TitleModel      string          `json:"titleModel,omitempty"` // fast/cheap model for auto-titling; defaults to primaryModel
 	SystemPrompt    string          `json:"systemPrompt,omitempty"`
 	BuiltinTools    []string        `json:"builtinTools,omitempty"`
 	Tools           []ToolEntry     `json:"tools"`

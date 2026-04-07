@@ -528,26 +528,31 @@ func (s *daemonServer) deleteSessionCtx(sessionId string) {
 }
 
 // generateTitle fires a background goroutine that calls the LLM to generate
-// a short, descriptive title for a session based on the user's first prompt.
-// The title is persisted to the session store; the frontend picks it up on
-// its next session list refetch (triggered by agent_finish).
+// a short, descriptive title for a session. Title stays empty until ready;
+// the frontend hides untitled sessions in the sidebar.
 func (s *daemonServer) generateTitle(sessionId, userPrompt string) {
-	// Set an immediate fallback title so the session isn't untitled while we wait
-	s.sessions.UpdateTitle(sessionId, truncate(userPrompt, 80))
-
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		model, err := resolveModel(ctx, s.cfg.PrimaryModel, s.bundle.providers, s.cfg.PrimaryProvider)
-		if err != nil {
-			slog.Warn("title generation: failed to resolve model", "error", err)
-			return // fallback title already set
+		// Use titleModel if configured, otherwise fall back to primaryModel
+		modelStr := s.cfg.TitleModel
+		if modelStr == "" {
+			modelStr = s.cfg.PrimaryModel
 		}
 
+		model, err := resolveModel(ctx, modelStr, s.bundle.providers, s.cfg.PrimaryProvider)
+		if err != nil {
+			slog.Warn("title generation: failed to resolve model", "error", err)
+			return
+		}
+
+		temp := 0.3
+		var maxTok int64 = 25
 		titleAgent := fantasy.NewAgent(model,
-			fantasy.WithSystemPrompt("Generate a short title (max 60 chars) for a conversation that starts with the following user message. Reply with ONLY the title, no quotes, no punctuation at the end, no explanation."),
-			fantasy.WithMaxOutputTokens(100),
+			fantasy.WithSystemPrompt("Title this chat in max 6 words. No quotes, no punctuation at the end."),
+			fantasy.WithTemperature(temp),
+			fantasy.WithMaxOutputTokens(maxTok),
 		)
 
 		result, err := titleAgent.Generate(ctx, fantasy.AgentCall{
@@ -555,12 +560,12 @@ func (s *daemonServer) generateTitle(sessionId, userPrompt string) {
 		})
 		if err != nil {
 			slog.Warn("title generation: LLM call failed", "error", err)
-			return // fallback title already set
+			return
 		}
 
 		title := strings.TrimSpace(result.Response.Content.Text())
 		if title == "" {
-			return // keep fallback
+			return
 		}
 		if len(title) > 80 {
 			title = truncate(title, 80)
