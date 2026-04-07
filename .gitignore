@@ -1,6 +1,7 @@
 # Binaries
 agent-runtime
 agent-runtime-fantasy
+agentops-runtime-fantasy
 *.exe
 
 # IDE

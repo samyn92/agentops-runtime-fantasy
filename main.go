@@ -527,6 +527,50 @@ func (s *daemonServer) deleteSessionCtx(sessionId string) {
 	}
 }
 
+// generateTitle fires a background goroutine that calls the LLM to generate
+// a short, descriptive title for a session based on the user's first prompt.
+// The title is persisted to the session store; the frontend picks it up on
+// its next session list refetch (triggered by agent_finish).
+func (s *daemonServer) generateTitle(sessionId, userPrompt string) {
+	// Set an immediate fallback title so the session isn't untitled while we wait
+	s.sessions.UpdateTitle(sessionId, truncate(userPrompt, 80))
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		model, err := resolveModel(ctx, s.cfg.PrimaryModel, s.bundle.providers, s.cfg.PrimaryProvider)
+		if err != nil {
+			slog.Warn("title generation: failed to resolve model", "error", err)
+			return // fallback title already set
+		}
+
+		titleAgent := fantasy.NewAgent(model,
+			fantasy.WithSystemPrompt("Generate a short title (max 60 chars) for a conversation that starts with the following user message. Reply with ONLY the title, no quotes, no punctuation at the end, no explanation."),
+			fantasy.WithMaxOutputTokens(100),
+		)
+
+		result, err := titleAgent.Generate(ctx, fantasy.AgentCall{
+			Prompt: userPrompt,
+		})
+		if err != nil {
+			slog.Warn("title generation: LLM call failed", "error", err)
+			return // fallback title already set
+		}
+
+		title := strings.TrimSpace(result.Response.Content.Text())
+		if title == "" {
+			return // keep fallback
+		}
+		if len(title) > 80 {
+			title = truncate(title, 80)
+		}
+
+		s.sessions.UpdateTitle(sessionId, title)
+		slog.Info("session title generated", "session", sessionId, "title", title)
+	}()
+}
+
 // ── Request/Response types ──
 
 type promptRequest struct {
@@ -681,9 +725,9 @@ func (s *daemonServer) handleSessionPrompt(w http.ResponseWriter, r *http.Reques
 		s.sessions.AppendMessages(sessionId, step.Messages...)
 	}
 
-	// Auto-title if this is the first message
+	// Auto-title if this is the first message (AI-generated, fire-and-forget)
 	if sess.MessageCount == 0 {
-		s.sessions.UpdateTitle(sessionId, truncate(req.Prompt, 80))
+		s.generateTitle(sessionId, req.Prompt)
 	}
 
 	s.mu.Lock()
@@ -924,10 +968,10 @@ func (s *daemonServer) handleSessionPromptStream(w http.ResponseWriter, r *http.
 			s.sessions.AppendMessages(sessionId, step.Messages...)
 		}
 
-		// Auto-title from first prompt
+		// Auto-title from first prompt (AI-generated, fire-and-forget)
 		sess, ok := s.sessions.Get(sessionId)
 		if ok && sess.MessageCount <= 2 {
-			s.sessions.UpdateTitle(sessionId, truncate(req.Prompt, 80))
+			s.generateTitle(sessionId, req.Prompt)
 		}
 
 		stepMu.Lock()

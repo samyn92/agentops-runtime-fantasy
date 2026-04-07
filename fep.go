@@ -253,6 +253,13 @@ func (e *fepEmitter) emitSessionStatus(sessionId, status string) {
 	})
 }
 
+func (e *fepEmitter) emitSessionTitleUpdated(sessionId, title string) {
+	e.emit("session_title_updated", map[string]any{
+		"session_id": sessionId,
+		"title":      title,
+	})
+}
+
 // --------------------------------------------------------------------
 // Helpers
 // --------------------------------------------------------------------
