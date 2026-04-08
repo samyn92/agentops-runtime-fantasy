@@ -177,6 +177,14 @@ func (wm *WorkingMemory) SetWindowSize(size int) {
 	}
 }
 
+// Clear drops all messages and resets the turn counter.
+func (wm *WorkingMemory) Clear() {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+	wm.messages = wm.messages[:0]
+	wm.turnNum = 0
+}
+
 // IsBusy and related state are tracked on daemonServer, not here.
 
 // ====================================================================

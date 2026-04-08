@@ -479,6 +479,7 @@ func runDaemon() error {
 
 	// Live configuration
 	mux.HandleFunc("PATCH /config/window-size", srv.handleSetWindowSize)
+	mux.HandleFunc("DELETE /working-memory", srv.handleClearWorkingMemory)
 
 	httpSrv := &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: mux}
 
@@ -1015,6 +1016,18 @@ func (s *daemonServer) handleSetWindowSize(w http.ResponseWriter, r *http.Reques
 
 	s.memory.SetWindowSize(req.Size)
 	slog.Info("window size updated", "new_size", req.Size, "messages", s.memory.MessageCount())
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"ok":          true,
+		"window_size": s.memory.WindowSize(),
+		"messages":    s.memory.MessageCount(),
+	})
+}
+
+func (s *daemonServer) handleClearWorkingMemory(w http.ResponseWriter, r *http.Request) {
+	s.memory.Clear()
+	slog.Info("working memory cleared")
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
