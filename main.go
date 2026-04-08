@@ -76,7 +76,7 @@ type agentBundle struct {
 	mcpConns  []mcpConnection
 }
 
-func buildAgentBundle(ctx context.Context, cfg *Config) (*agentBundle, error) {
+func buildAgentBundle(ctx context.Context, cfg *Config, extraTools ...fantasy.AgentTool) (*agentBundle, error) {
 	// Resolve providers
 	providers := make(map[string]fantasy.Provider)
 	for _, p := range cfg.Providers {
@@ -130,6 +130,9 @@ func buildAgentBundle(ctx context.Context, cfg *Config) (*agentBundle, error) {
 	} else {
 		tools = append(tools, newRunAgentTool(k8sClient), newGetAgentRunTool(k8sClient))
 	}
+
+	// Add any extra tools (e.g. memory tools from Engram)
+	tools = append(tools, extraTools...)
 
 	// Build agent options
 	opts := []fantasy.AgentOption{
@@ -285,12 +288,6 @@ func runDaemon() error {
 		"fallbackModels", len(cfg.FallbackModels),
 	)
 
-	bundle, err := buildAgentBundle(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	defer shutdownMCPConnections(bundle.mcpConns)
-
 	// Determine agent name (used as Engram project scope)
 	agentName := os.Getenv("AGENT_NAME")
 	if agentName == "" {
@@ -323,6 +320,13 @@ func runDaemon() error {
 	}
 
 	_ = contextLimit // used in prompt handlers via cfg
+
+	// Build agent bundle (includes memory tools if engram is available)
+	bundle, err := buildAgentBundle(ctx, cfg, buildMemoryTools(engram)...)
+	if err != nil {
+		return err
+	}
+	defer shutdownMCPConnections(bundle.mcpConns)
 
 	srv := &daemonServer{
 		bundle:      bundle,
@@ -1030,7 +1034,25 @@ func runTask() error {
 		"prompt", truncate(prompt, 100),
 	)
 
-	bundle, err := buildAgentBundle(ctx, cfg)
+	// Task agents: memory tools optional (short-lived, but can still save observations)
+	var engram *EngramClient
+	if cfg.Memory != nil {
+		agentName := os.Getenv("AGENT_NAME")
+		if agentName == "" {
+			agentName = "default"
+		}
+		project := cfg.Memory.Project
+		if project == "" {
+			project = agentName
+		}
+		engram = NewEngramClient(cfg.Memory.ServerURL, project)
+		if err := engram.Init(); err != nil {
+			slog.Warn("engram init failed for task, running without memory", "error", err)
+			engram = nil
+		}
+	}
+
+	bundle, err := buildAgentBundle(ctx, cfg, buildMemoryTools(engram)...)
 	if err != nil {
 		result := taskResult{Success: false, Error: err.Error(), Model: cfg.PrimaryModel}
 		json.NewEncoder(os.Stdout).Encode(result)

@@ -18,6 +18,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -66,9 +67,13 @@ func (wm *WorkingMemory) Messages() []fantasy.Message {
 }
 
 // Append adds messages to the window, dropping the oldest if the window is full.
-// Messages are trimmed from the front to stay within maxSize, ensuring we always
-// keep the most recent messages. We trim at user-message boundaries to avoid
-// orphaned tool-result messages.
+// Messages are trimmed from the front to stay within maxSize. We trim at clean
+// boundaries to avoid orphaning tool messages (assistant tool_use must stay
+// paired with the following tool result).
+//
+// A clean boundary is a user message that is NOT a tool-result message
+// (role == "user", not role == "tool"). We scan forward from the excess point
+// to find such a boundary.
 func (wm *WorkingMemory) Append(msgs ...fantasy.Message) {
 	wm.mu.Lock()
 	defer wm.mu.Unlock()
@@ -79,13 +84,29 @@ func (wm *WorkingMemory) Append(msgs ...fantasy.Message) {
 	if len(wm.messages) > wm.maxSize {
 		excess := len(wm.messages) - wm.maxSize
 
-		// Try to find a user-message boundary near the trim point so we
-		// don't leave orphaned assistant/tool messages at the start.
+		// Find a safe trim point: must be a user message (not tool/assistant).
+		// Scan forward from excess to find one. This ensures we never leave an
+		// orphaned tool-result at the start (which requires its preceding
+		// assistant tool_use message).
 		trimAt := excess
-		for i := excess; i < len(wm.messages) && i < excess+5; i++ {
+		for i := excess; i < len(wm.messages); i++ {
 			if wm.messages[i].Role == fantasy.MessageRoleUser {
 				trimAt = i
 				break
+			}
+			// If we hit another assistant message, that's also safe — it starts
+			// a new exchange. But prefer user messages.
+			if wm.messages[i].Role == fantasy.MessageRoleAssistant && i > excess {
+				trimAt = i
+				break
+			}
+		}
+
+		// Safety: if trimAt would leave us with 0 messages, just keep the last maxSize
+		if trimAt >= len(wm.messages) {
+			trimAt = len(wm.messages) - wm.maxSize
+			if trimAt < 0 {
+				trimAt = 0
 			}
 		}
 
@@ -388,4 +409,113 @@ func (ec *EngramClient) post(path string, payload any) ([]byte, error) {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 	return body, nil
+}
+
+// ====================================================================
+// Memory Tools — Fantasy AgentTools that let the agent interact with Engram
+// ====================================================================
+
+// buildMemoryTools returns Fantasy AgentTools for memory operations.
+// Returns nil if engram is nil (memory disabled).
+func buildMemoryTools(engram *EngramClient) []fantasy.AgentTool {
+	if engram == nil {
+		return nil
+	}
+	return []fantasy.AgentTool{
+		newMemSaveTool(engram),
+		newMemSearchTool(engram),
+		newMemContextTool(engram),
+	}
+}
+
+// ── mem_save ──
+
+type memSaveInput struct {
+	Type    string   `json:"type" description:"Observation type: decision, discovery, bugfix, pattern, architecture, config, learning, preference"`
+	Title   string   `json:"title" description:"Brief title summarizing what was learned or decided"`
+	Content string   `json:"content" description:"Detailed content — what was learned, why it matters, how to apply it"`
+	Tags    []string `json:"tags,omitempty" description:"Optional tags for categorization"`
+}
+
+func newMemSaveTool(engram *EngramClient) fantasy.AgentTool {
+	return fantasy.NewAgentTool("mem_save",
+		"Save an observation to long-term memory (Engram). Use this proactively to remember important decisions, discoveries, bugfixes, patterns, and lessons learned. These memories persist across conversations and restarts.",
+		func(_ context.Context, input memSaveInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+			if input.Title == "" || input.Content == "" {
+				return fantasy.NewTextErrorResponse("title and content are required"), nil
+			}
+			if input.Type == "" {
+				input.Type = "discovery"
+			}
+
+			err := engram.SaveObservation(input.Type, input.Title, input.Content, input.Tags)
+			if err != nil {
+				return fantasy.NewTextErrorResponse(fmt.Sprintf("failed to save memory: %s", err)), nil
+			}
+
+			return fantasy.NewTextResponse(fmt.Sprintf("Saved [%s] %s", input.Type, input.Title)), nil
+		})
+}
+
+// ── mem_search ──
+
+type memSearchInput struct {
+	Query string `json:"query" description:"Full-text search query across all memories"`
+	Limit int    `json:"limit,omitempty" description:"Max results to return (default: 10)"`
+}
+
+func newMemSearchTool(engram *EngramClient) fantasy.AgentTool {
+	return fantasy.NewAgentTool("mem_search",
+		"Search long-term memory (Engram) using full-text search. Returns matching observations ranked by relevance. Use this to recall past decisions, discoveries, bugfixes, and lessons.",
+		func(_ context.Context, input memSearchInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+			if input.Query == "" {
+				return fantasy.NewTextErrorResponse("query is required"), nil
+			}
+			limit := input.Limit
+			if limit <= 0 {
+				limit = 10
+			}
+
+			results, err := engram.Search(input.Query, limit)
+			if err != nil {
+				return fantasy.NewTextErrorResponse(fmt.Sprintf("search failed: %s", err)), nil
+			}
+
+			if len(results) == 0 {
+				return fantasy.NewTextResponse("No memories found matching the query."), nil
+			}
+
+			var buf bytes.Buffer
+			fmt.Fprintf(&buf, "Found %d memories:\n\n", len(results))
+			for i, r := range results {
+				fmt.Fprintf(&buf, "%d. [%s] %s (rank: %.1f)\n   %s\n\n",
+					i+1, r.Type, r.Title, r.Rank, r.Content)
+			}
+
+			return fantasy.NewTextResponse(buf.String()), nil
+		})
+}
+
+// ── mem_context ──
+
+type memContextInput struct {
+	Limit int `json:"limit,omitempty" description:"Number of recent memory items to retrieve (default: 5)"`
+}
+
+func newMemContextTool(engram *EngramClient) fantasy.AgentTool {
+	return fantasy.NewAgentTool("mem_context",
+		"Retrieve recent memory context from Engram — recent observations and session summaries. Use this to refresh your knowledge about what happened in previous sessions.",
+		func(_ context.Context, input memContextInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+			limit := input.Limit
+			if limit <= 0 {
+				limit = 5
+			}
+
+			ctx := engram.FetchContext(limit)
+			if ctx == "" {
+				return fantasy.NewTextResponse("No recent memory context available."), nil
+			}
+
+			return fantasy.NewTextResponse(ctx), nil
+		})
 }
