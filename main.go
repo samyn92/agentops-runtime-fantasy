@@ -477,6 +477,9 @@ func runDaemon() error {
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
 	mux.HandleFunc("GET /status", srv.handleStatus)
 
+	// Live configuration
+	mux.HandleFunc("PATCH /config/window-size", srv.handleSetWindowSize)
+
 	httpSrv := &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: mux}
 
 	go func() {
@@ -998,6 +1001,26 @@ func (s *daemonServer) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		"window_size":    s.memory.WindowSize(),
 		"turns":          s.memory.TurnCount(),
 		"memory_enabled": s.engram != nil,
+	})
+}
+
+func (s *daemonServer) handleSetWindowSize(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Size int `json:"size"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Size < 2 {
+		http.Error(w, `{"error":"size is required and must be >= 2"}`, http.StatusBadRequest)
+		return
+	}
+
+	s.memory.SetWindowSize(req.Size)
+	slog.Info("window size updated", "new_size", req.Size, "messages", s.memory.MessageCount())
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"ok":          true,
+		"window_size": s.memory.WindowSize(),
+		"messages":    s.memory.MessageCount(),
 	})
 }
 

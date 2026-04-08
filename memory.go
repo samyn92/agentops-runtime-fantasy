@@ -137,7 +137,44 @@ func (wm *WorkingMemory) MessageCount() int {
 
 // WindowSize returns the maximum sliding window capacity.
 func (wm *WorkingMemory) WindowSize() int {
+	wm.mu.RLock()
+	defer wm.mu.RUnlock()
 	return wm.maxSize
+}
+
+// SetWindowSize changes the sliding window capacity at runtime.
+// If the new size is smaller than the current message count, excess messages
+// are trimmed from the front (oldest first) at the next Append call.
+// Minimum size is 2.
+func (wm *WorkingMemory) SetWindowSize(size int) {
+	if size < 2 {
+		size = 2
+	}
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+	wm.maxSize = size
+	// Eagerly trim if currently over the new limit
+	if len(wm.messages) > wm.maxSize {
+		excess := len(wm.messages) - wm.maxSize
+		trimAt := excess
+		for i := excess; i < len(wm.messages); i++ {
+			if wm.messages[i].Role == fantasy.MessageRoleUser {
+				trimAt = i
+				break
+			}
+			if wm.messages[i].Role == fantasy.MessageRoleAssistant && i > excess {
+				trimAt = i
+				break
+			}
+		}
+		if trimAt >= len(wm.messages) {
+			trimAt = len(wm.messages) - wm.maxSize
+			if trimAt < 0 {
+				trimAt = 0
+			}
+		}
+		wm.messages = wm.messages[trimAt:]
+	}
 }
 
 // IsBusy and related state are tracked on daemonServer, not here.
