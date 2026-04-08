@@ -135,6 +135,11 @@ func (wm *WorkingMemory) MessageCount() int {
 	return len(wm.messages)
 }
 
+// WindowSize returns the maximum sliding window capacity.
+func (wm *WorkingMemory) WindowSize() int {
+	return wm.maxSize
+}
+
 // IsBusy and related state are tracked on daemonServer, not here.
 
 // ====================================================================

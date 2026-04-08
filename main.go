@@ -995,6 +995,7 @@ func (s *daemonServer) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		"total_steps":    steps,
 		"busy":           busy,
 		"messages":       s.memory.MessageCount(),
+		"window_size":    s.memory.WindowSize(),
 		"turns":          s.memory.TurnCount(),
 		"memory_enabled": s.engram != nil,
 	})
