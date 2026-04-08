@@ -586,8 +586,9 @@ func (s *daemonServer) generateTitle(sessionId, userPrompt string) {
 // ── Request/Response types ──
 
 type promptRequest struct {
-	Prompt    string `json:"prompt"`
-	SessionID string `json:"session_id,omitempty"` // optional, for legacy endpoints
+	Prompt    string            `json:"prompt"`
+	SessionID string            `json:"session_id,omitempty"` // optional, for legacy endpoints
+	Context   []ResourceContext `json:"context,omitempty"`    // per-turn resource context from console
 }
 
 type promptResponse struct {
@@ -725,8 +726,16 @@ func (s *daemonServer) handleSessionPrompt(w http.ResponseWriter, r *http.Reques
 		s.generateTitle(sessionId, req.Prompt)
 	}
 
+	// Build the effective prompt: prepend resource context if provided (Option B)
+	effectivePrompt := req.Prompt
+	if len(req.Context) > 0 {
+		contextPrefix := formatResourceContext(req.Context)
+		effectivePrompt = contextPrefix + req.Prompt
+		slog.Info("resource context injected", "session", sessionId, "items", len(req.Context))
+	}
+
 	result, usedModel, err := generateWithFallback(ctx, s.cfg, s.bundle, fantasy.AgentCall{
-		Prompt:   req.Prompt,
+		Prompt:   effectivePrompt,
 		Messages: messages,
 	})
 	if err != nil {
@@ -736,7 +745,7 @@ func (s *daemonServer) handleSessionPrompt(w http.ResponseWriter, r *http.Reques
 
 	output := result.Response.Content.Text()
 
-	// Persist conversation history
+	// Persist conversation history (use original prompt, not enriched)
 	s.sessions.AppendMessages(sessionId, fantasy.NewUserMessage(req.Prompt))
 	for _, step := range result.Steps {
 		s.sessions.AppendMessages(sessionId, step.Messages...)
@@ -824,6 +833,14 @@ func (s *daemonServer) handleSessionPromptStream(w http.ResponseWriter, r *http.
 		s.generateTitle(sessionId, req.Prompt)
 	}
 
+	// Build the effective prompt: prepend resource context if provided (Option B)
+	effectivePrompt := req.Prompt
+	if len(req.Context) > 0 {
+		contextPrefix := formatResourceContext(req.Context)
+		effectivePrompt = contextPrefix + req.Prompt
+		slog.Info("resource context injected (stream)", "session", sessionId, "items", len(req.Context))
+	}
+
 	// Step counter (shared across callbacks)
 	var stepCount int
 	var stepMu sync.Mutex
@@ -832,7 +849,7 @@ func (s *daemonServer) handleSessionPromptStream(w http.ResponseWriter, r *http.
 	emit.emitAgentStart(sessionId, req.Prompt)
 
 	result, usedModel, err := streamWithFallback(ctx, s.cfg, s.bundle, fantasy.AgentStreamCall{
-		Prompt:   req.Prompt,
+		Prompt:   effectivePrompt,
 		Messages: messages,
 
 		// ── Agent lifecycle ──
@@ -982,7 +999,7 @@ func (s *daemonServer) handleSessionPromptStream(w http.ResponseWriter, r *http.
 	if err != nil {
 		emit.emitAgentError(sessionId, err, isRetryableError(err))
 	} else {
-		// Persist conversation history
+		// Persist conversation history (use original prompt, not enriched)
 		s.sessions.AppendMessages(sessionId, fantasy.NewUserMessage(req.Prompt))
 		for _, step := range result.Steps {
 			s.sessions.AppendMessages(sessionId, step.Messages...)

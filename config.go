@@ -20,6 +20,7 @@ type Config struct {
 	MCPServers      []MCPEntry      `json:"mcpServers,omitempty"`
 	ToolHooks       *ToolHooksEntry `json:"toolHooks,omitempty"`
 	ContextFiles    []ContextEntry  `json:"contextFiles,omitempty"`
+	Resources       []ResourceEntry `json:"resources,omitempty"`
 	Temperature     *float64        `json:"temperature,omitempty"`
 	MaxOutputTokens *int64          `json:"maxOutputTokens,omitempty"`
 	MaxSteps        *int            `json:"maxSteps,omitempty"`
@@ -61,4 +62,72 @@ type ToolHooksEntry struct {
 // ContextEntry describes a context file.
 type ContextEntry struct {
 	Path string `json:"path"`
+}
+
+// ResourceEntry describes an AgentResource bound to this agent.
+// Mirrors the operator's AgentResourceEntry from configmap.go.
+type ResourceEntry struct {
+	Name        string `json:"name"`
+	Kind        string `json:"kind"`
+	DisplayName string `json:"displayName"`
+	Description string `json:"description,omitempty"`
+	ReadOnly    bool   `json:"readOnly,omitempty"`
+	AutoContext bool   `json:"autoContext,omitempty"`
+
+	// Kind-specific config (one of these will be set)
+	GitHub        *ResourceGitHubEntry        `json:"github,omitempty"`
+	GitHubOrg     *ResourceGitHubOrgEntry     `json:"githubOrg,omitempty"`
+	GitLab        *ResourceGitLabEntry        `json:"gitlab,omitempty"`
+	GitLabGroup   *ResourceGitLabGroupEntry   `json:"gitlabGroup,omitempty"`
+	Git           *ResourceGitEntry           `json:"git,omitempty"`
+	MCP           *ResourceMCPEntry           `json:"mcp,omitempty"`
+	S3            *ResourceS3Entry            `json:"s3,omitempty"`
+	Documentation *ResourceDocumentationEntry `json:"documentation,omitempty"`
+}
+
+type ResourceGitHubEntry struct {
+	Owner         string `json:"owner"`
+	Repo          string `json:"repo"`
+	DefaultBranch string `json:"defaultBranch,omitempty"`
+	APIURL        string `json:"apiURL,omitempty"`
+}
+
+type ResourceGitHubOrgEntry struct {
+	Org        string   `json:"org"`
+	RepoFilter []string `json:"repoFilter,omitempty"`
+	APIURL     string   `json:"apiURL,omitempty"`
+}
+
+type ResourceGitLabEntry struct {
+	BaseURL       string `json:"baseURL"`
+	Project       string `json:"project"`
+	DefaultBranch string `json:"defaultBranch,omitempty"`
+}
+
+type ResourceGitLabGroupEntry struct {
+	BaseURL  string   `json:"baseURL"`
+	Group    string   `json:"group"`
+	Projects []string `json:"projects,omitempty"`
+}
+
+type ResourceGitEntry struct {
+	URL    string `json:"url"`
+	Branch string `json:"branch,omitempty"`
+}
+
+type ResourceMCPEntry struct {
+	URL       string            `json:"url"`
+	Transport string            `json:"transport,omitempty"`
+	Headers   map[string]string `json:"headers,omitempty"`
+}
+
+type ResourceS3Entry struct {
+	Bucket   string `json:"bucket"`
+	Region   string `json:"region,omitempty"`
+	Endpoint string `json:"endpoint,omitempty"`
+	Prefix   string `json:"prefix,omitempty"`
+}
+
+type ResourceDocumentationEntry struct {
+	URLs []string `json:"urls,omitempty"`
 }
