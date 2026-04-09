@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -1519,8 +1520,10 @@ func runGit(dir string, args ...string) error {
 	cmd.Env = os.Environ()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		slog.Error("git command failed", "args", args, "output", string(out), "error", err)
-		return fmt.Errorf("git %s: %s", args[0], string(out))
+		safeArgs := sanitizeGitArgs(args)
+		safeOut := sanitizeURLCredentials(string(out))
+		slog.Error("git command failed", "args", safeArgs, "output", safeOut, "error", err)
+		return fmt.Errorf("git %s: %s", args[0], safeOut)
 	}
 	return nil
 }
@@ -1537,6 +1540,27 @@ func runGitOutput(dir string, args ...string) (string, error) {
 		return "", err
 	}
 	return string(out), nil
+}
+
+// sanitizeGitArgs redacts credentials from git command args (e.g., URL-embedded tokens).
+func sanitizeGitArgs(args []string) []string {
+	safe := make([]string, len(args))
+	for i, arg := range args {
+		if u, err := url.Parse(arg); err == nil && u.User != nil {
+			u.User = url.User("***")
+			safe[i] = u.String()
+		} else {
+			safe[i] = arg
+		}
+	}
+	return safe
+}
+
+// sanitizeURLCredentials replaces URL-embedded credentials in a string.
+func sanitizeURLCredentials(s string) string {
+	// Match https://user:pass@host patterns and redact the credentials
+	re := regexp.MustCompile(`(https?://)([^@]+)@`)
+	return re.ReplaceAllString(s, "${1}***@")
 }
 
 // parseHost extracts the hostname from a URL.
