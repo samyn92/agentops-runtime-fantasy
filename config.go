@@ -36,6 +36,16 @@ type Config struct {
 	// Memory configuration for the Engram shared memory system.
 	// When set, the runtime connects to Engram's REST API for persistent memory.
 	Memory *MemoryConfig `json:"memory,omitempty"`
+
+	// Maximum characters allowed in a single tool result before truncation.
+	// Prevents large tool outputs (bash, grep, read, fetch) from blowing up
+	// the context window. Default: 50000 (~12k tokens).
+	MaxToolResultChars int `json:"maxToolResultChars,omitempty"`
+
+	// Fraction of the model's context window to use as the input token budget.
+	// When a step's input tokens exceed this fraction, the agent loop stops.
+	// Default: 0.75. Valid range: (0, 1).
+	BudgetFraction *float64 `json:"budgetFraction,omitempty"`
 }
 
 // MemoryConfig configures the Engram memory integration.
@@ -49,8 +59,6 @@ type MemoryConfig struct {
 	ContextLimit int `json:"contextLimit,omitempty"`
 	// Sliding window size for working memory (default: 20).
 	WindowSize int `json:"windowSize,omitempty"`
-	// Whether to auto-summarize at session end (default: true).
-	AutoSummarize *bool `json:"autoSummarize,omitempty"`
 }
 
 // ProviderEntry describes a configured provider.

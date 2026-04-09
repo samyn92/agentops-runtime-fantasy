@@ -360,16 +360,17 @@ func (ec *EngramClient) PassiveCapture(assistantOutput string) {
 	}()
 }
 
-// EndSession ends the Engram session with an optional summary.
-// Called on daemon shutdown.
-func (ec *EngramClient) EndSession(summary string) {
+// EndSession ends the Engram session with an optional conversation transcript.
+// Engram is responsible for summarization — the runtime sends raw messages.
+// Called on daemon shutdown and task completion.
+func (ec *EngramClient) EndSession(messages []EngramSessionMessage) {
 	if ec == nil {
 		return
 	}
 
-	body := map[string]string{}
-	if summary != "" {
-		body["summary"] = summary
+	body := map[string]any{}
+	if len(messages) > 0 {
+		body["messages"] = messages
 	}
 
 	_, err := ec.post("/sessions/"+ec.sessionID+"/end", body)
@@ -378,6 +379,43 @@ func (ec *EngramClient) EndSession(summary string) {
 	} else {
 		slog.Info("engram session ended", "session_id", ec.sessionID)
 	}
+}
+
+// EngramSessionMessage is a minimal message representation sent to Engram
+// for session persistence and server-side summarization.
+type EngramSessionMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// fantasyToEngramMessages converts Fantasy SDK messages to the minimal
+// Engram session message format for session persistence.
+func fantasyToEngramMessages(messages []fantasy.Message) []EngramSessionMessage {
+	var result []EngramSessionMessage
+	for _, msg := range messages {
+		var text string
+		for _, part := range msg.Content {
+			switch p := part.(type) {
+			case fantasy.TextPart:
+				if p.Text != "" {
+					text += p.Text
+				}
+			case fantasy.ToolCallPart:
+				text += fmt.Sprintf("[tool_call: %s]", p.ToolName)
+			}
+		}
+		if text != "" {
+			// Cap individual messages to avoid sending enormous payloads
+			if len(text) > 5000 {
+				text = text[:5000] + "..."
+			}
+			result = append(result, EngramSessionMessage{
+				Role:    string(msg.Role),
+				Content: text,
+			})
+		}
+	}
+	return result
 }
 
 // Search performs a full-text search across memories.

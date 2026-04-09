@@ -121,8 +121,8 @@ func buildAgentBundle(ctx context.Context, cfg *Config, extraTools ...fantasy.Ag
 		allMCPConns = append(allMCPConns, conns...)
 	}
 
-	// Wrap with security hooks
-	tools = wrapToolsWithHooks(tools, cfg.ToolHooks)
+	// Wrap with security hooks + output truncation
+	tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars)
 
 	// Add orchestration tools (run_agent, get_agent_run)
 	k8sClient, err := NewK8sClient()
@@ -130,15 +130,26 @@ func buildAgentBundle(ctx context.Context, cfg *Config, extraTools ...fantasy.Ag
 		slog.Warn("K8s client unavailable, orchestration tools disabled", "error", err)
 		tools = append(tools, newRunAgentToolStub(), newGetAgentRunToolStub())
 	} else {
-		tools = append(tools, newRunAgentTool(k8sClient), newGetAgentRunTool(k8sClient))
+		tools = append(tools, newRunAgentTool(k8sClient, cfg.Resources), newGetAgentRunTool(k8sClient))
 	}
 
 	// Add any extra tools (e.g. memory tools from Engram)
 	tools = append(tools, extraTools...)
 
+	// Apply Anthropic prompt caching to tool definitions (if using Anthropic)
+	if isAnthropicProvider(cfg) {
+		applyToolCaching(tools)
+		slog.Info("anthropic prompt caching enabled for tools", "tool_count", len(tools))
+	}
+
 	// Build agent options
 	opts := []fantasy.AgentOption{
 		fantasy.WithTools(tools...),
+	}
+
+	// Add Anthropic message caching via PrepareStep
+	if isAnthropicProvider(cfg) {
+		opts = append(opts, fantasy.WithPrepareStep(prepareStepWithCaching()))
 	}
 
 	if cfg.SystemPrompt != "" {
@@ -153,6 +164,22 @@ func buildAgentBundle(ctx context.Context, cfg *Config, extraTools ...fantasy.Ag
 	if cfg.MaxSteps != nil {
 		opts = append(opts, fantasy.WithStopConditions(fantasy.StepCountIs(*cfg.MaxSteps)))
 	}
+
+	// Input token budget guard: stop the agent loop before context window overflow.
+	// Uses 75% of the model's context window as the budget by default.
+	budgetFraction := DefaultBudgetFraction
+	if cfg.BudgetFraction != nil && *cfg.BudgetFraction > 0 && *cfg.BudgetFraction < 1 {
+		budgetFraction = *cfg.BudgetFraction
+	}
+	contextWindow := contextWindowForModel(cfg.PrimaryModel)
+	budgetTokens := int64(float64(contextWindow) * budgetFraction)
+	opts = append(opts, fantasy.WithStopConditions(InputTokenBudget(budgetTokens)))
+	slog.Info("input token budget configured",
+		"model", cfg.PrimaryModel,
+		"context_window", contextWindow,
+		"budget_fraction", budgetFraction,
+		"budget_tokens", budgetTokens,
+	)
 
 	return &agentBundle{
 		agent:     fantasy.NewAgent(model, opts...),
@@ -379,7 +406,7 @@ func runDaemon() error {
 			gwTools, _, _ := loadGatewayMCPTools(ctx, cfg.MCPServers)
 			tools = append(tools, gwTools...)
 		}
-		tools = wrapToolsWithHooks(tools, cfg.ToolHooks)
+		tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars)
 
 		// Wrap with permission gates
 		tools = srv.permGate.wrapTools(tools, cfg.PermissionTools)
@@ -387,7 +414,7 @@ func runDaemon() error {
 		// Add orchestration tools
 		k8sClient, _ := NewK8sClient()
 		if k8sClient != nil {
-			tools = append(tools, newRunAgentTool(k8sClient), newGetAgentRunTool(k8sClient))
+			tools = append(tools, newRunAgentTool(k8sClient, cfg.Resources), newGetAgentRunTool(k8sClient))
 		}
 
 		// Add question tool if enabled
@@ -430,11 +457,11 @@ func runDaemon() error {
 			gwTools, _, _ := loadGatewayMCPTools(ctx, cfg.MCPServers)
 			tools = append(tools, gwTools...)
 		}
-		tools = wrapToolsWithHooks(tools, cfg.ToolHooks)
+		tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars)
 
 		k8sClient, _ := NewK8sClient()
 		if k8sClient != nil {
-			tools = append(tools, newRunAgentTool(k8sClient), newGetAgentRunTool(k8sClient))
+			tools = append(tools, newRunAgentTool(k8sClient, cfg.Resources), newGetAgentRunTool(k8sClient))
 		}
 
 		tools = append(tools, newQuestionTool(srv.questionGate))
@@ -492,9 +519,10 @@ func runDaemon() error {
 	go func() {
 		<-ctx.Done()
 		slog.Info("shutting down...")
-		// End Engram session on graceful shutdown
+
+		// End Engram session with raw messages — Engram handles summarization
 		if srv.engram != nil {
-			srv.engram.EndSession("")
+			srv.engram.EndSession(fantasyToEngramMessages(srv.memory.Messages()))
 		}
 		httpSrv.Close()
 	}()
@@ -1353,6 +1381,18 @@ func runTask() error {
 		result.Commits, result.PullRequestURL = extractGitInfo()
 	}
 
+	// End Engram session with raw messages (fixes session leak in task mode).
+	// Engram handles summarization server-side.
+	if engram != nil {
+		taskMessages := []fantasy.Message{
+			fantasy.NewUserMessage(prompt),
+		}
+		for _, step := range agentResult.Steps {
+			taskMessages = append(taskMessages, step.Messages...)
+		}
+		engram.EndSession(fantasyToEngramMessages(taskMessages))
+	}
+
 	writeTaskResult(result)
 
 	return nil
@@ -1364,6 +1404,13 @@ func setupGitWorkspace(repoURL, branch, baseBranch string) error {
 	repoDir := "/data/repo"
 	token := os.Getenv("GIT_TOKEN")
 
+	// Ensure HOME is writable (container may run as root with HOME=/)
+	home, _ := os.UserHomeDir()
+	if home == "" || home == "/" {
+		home = "/data"
+		os.Setenv("HOME", home)
+	}
+
 	// Configure git credential helper if we have a token
 	if token != "" {
 		// Write .netrc for HTTPS auth (works with both GitHub and GitLab)
@@ -1374,10 +1421,6 @@ func setupGitWorkspace(repoURL, branch, baseBranch string) error {
 		// Also handle custom hosts from the URL
 		if u, err := parseHost(repoURL); err == nil && u != "github.com" && u != "gitlab.com" {
 			netrcContent += fmt.Sprintf("machine %s\nlogin oauth2\npassword %s\n\n", u, token)
-		}
-		home, _ := os.UserHomeDir()
-		if home == "" {
-			home = "/tmp"
 		}
 		if err := os.WriteFile(home+"/.netrc", []byte(netrcContent), 0600); err != nil {
 			slog.Warn("failed to write .netrc", "error", err)
@@ -1500,9 +1543,66 @@ type runAgentInput struct {
 	GitBaseBranch string `json:"git_base_branch,omitempty" description:"Base branch for PR/MR target (e.g. main). Defaults to repo default."`
 }
 
-func newRunAgentTool(k8s *K8sClient) fantasy.AgentTool {
-	return fantasy.NewAgentTool("run_agent",
-		"Trigger another agent with a prompt. Creates an AgentRun CR tracked by the operator. Use get_agent_run to poll for completion. Set git_resource + git_branch to give the task agent a git workspace (clone, branch, commit, push, create PR).",
+// buildRunAgentDescription constructs a dynamic tool description that includes
+// the available git resources bound to this agent. This gives the LLM full
+// context about what repos it can delegate work to without needing to query
+// the cluster.
+func buildRunAgentDescription(resources []ResourceEntry) string {
+	base := "Delegate a task to another agent. Creates an AgentRun tracked by the operator. " +
+		"Use get_agent_run to poll for completion."
+
+	// Build git resource list
+	var gitResources []string
+	for _, r := range resources {
+		switch r.Kind {
+		case "github-repo":
+			if r.GitHub != nil {
+				detail := fmt.Sprintf("  - %q (GitHub: %s/%s", r.Name, r.GitHub.Owner, r.GitHub.Repo)
+				if r.GitHub.DefaultBranch != "" {
+					detail += fmt.Sprintf(", default branch: %s", r.GitHub.DefaultBranch)
+				}
+				detail += ")"
+				if r.Description != "" {
+					detail += " — " + r.Description
+				}
+				gitResources = append(gitResources, detail)
+			}
+		case "gitlab-project":
+			if r.GitLab != nil {
+				detail := fmt.Sprintf("  - %q (GitLab: %s", r.Name, r.GitLab.Project)
+				if r.GitLab.DefaultBranch != "" {
+					detail += fmt.Sprintf(", default branch: %s", r.GitLab.DefaultBranch)
+				}
+				detail += ")"
+				if r.Description != "" {
+					detail += " — " + r.Description
+				}
+				gitResources = append(gitResources, detail)
+			}
+		case "git-repo":
+			if r.Git != nil {
+				detail := fmt.Sprintf("  - %q (git: %s)", r.Name, r.Git.URL)
+				if r.Description != "" {
+					detail += " — " + r.Description
+				}
+				gitResources = append(gitResources, detail)
+			}
+		}
+	}
+
+	if len(gitResources) > 0 {
+		base += "\n\nFor coding/git tasks, set git_resource + git_branch to give the task agent a cloned repo workspace. " +
+			"The agent will clone the repo, create/checkout the branch, work, commit, push, and create a PR/MR.\n\n" +
+			"Available git resources (use the name as git_resource value):\n" +
+			strings.Join(gitResources, "\n")
+	}
+
+	return base
+}
+
+func newRunAgentTool(k8s *K8sClient, resources []ResourceEntry) fantasy.AgentTool {
+	desc := buildRunAgentDescription(resources)
+	return fantasy.NewAgentTool("run_agent", desc,
 		func(ctx context.Context, input runAgentInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if input.Agent == "" || input.Prompt == "" {
 				return fantasy.NewTextErrorResponse("agent and prompt are required"), nil
