@@ -60,8 +60,11 @@ type ProviderEntry struct {
 
 // ToolEntry describes a tool package path (MCP server in OCI).
 type ToolEntry struct {
-	Name string `json:"name"`
-	Path string `json:"path"`
+	Name        string `json:"name"`
+	Path        string `json:"path"`
+	Description string `json:"description,omitempty"`
+	Category    string `json:"category,omitempty"`
+	UIHint      string `json:"uiHint,omitempty"`
 }
 
 // MCPEntry describes an MCP server binding (via gateway sidecar).
@@ -69,6 +72,9 @@ type MCPEntry struct {
 	Name        string   `json:"name"`
 	Port        int      `json:"port"`
 	DirectTools []string `json:"directTools,omitempty"`
+	Description string   `json:"description,omitempty"`
+	Category    string   `json:"category,omitempty"`
+	UIHint      string   `json:"uiHint,omitempty"`
 }
 
 // ToolHooksEntry holds runtime hook config.

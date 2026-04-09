@@ -76,7 +76,7 @@ func loadOCITools(ctx context.Context, toolRefs []ToolEntry) ([]fantasy.AgentToo
 		}
 		conns = append(conns, *conn)
 
-		mcpTools, err := discoverMCPTools(ctx, conn.session, ref.Name, "stdio")
+		mcpTools, err := discoverMCPTools(ctx, conn.session, ref.Name, "stdio", ref.UIHint)
 		if err != nil {
 			slog.Error("failed to discover MCP tools", "tool", ref.Name, "error", err)
 			continue
@@ -104,7 +104,7 @@ func loadGatewayMCPTools(ctx context.Context, mcpServers []MCPEntry) ([]fantasy.
 		}
 		conns = append(conns, *conn)
 
-		mcpTools, err := discoverMCPTools(ctx, conn.session, srv.Name, "sse")
+		mcpTools, err := discoverMCPTools(ctx, conn.session, srv.Name, "sse", srv.UIHint)
 		if err != nil {
 			slog.Error("failed to discover MCP tools from gateway", "server", srv.Name, "error", err)
 			continue
@@ -158,7 +158,7 @@ func startSSEMCP(ctx context.Context, name, sseURL string) (*mcpConnection, erro
 }
 
 // discoverMCPTools lists tools from an MCP session and wraps as fantasy.AgentTool.
-func discoverMCPTools(ctx context.Context, session *mcp.ClientSession, serverName string, transport string) ([]fantasy.AgentTool, error) {
+func discoverMCPTools(ctx context.Context, session *mcp.ClientSession, serverName string, transport string, crdUIHint string) ([]fantasy.AgentTool, error) {
 	result, err := session.ListTools(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("list tools: %w", err)
@@ -166,7 +166,7 @@ func discoverMCPTools(ctx context.Context, session *mcp.ClientSession, serverNam
 
 	var tools []fantasy.AgentTool
 	for _, t := range result.Tools {
-		tools = append(tools, newMCPToolAdapter(session, serverName, t, transport))
+		tools = append(tools, newMCPToolAdapter(session, serverName, t, transport, crdUIHint))
 	}
 	return tools, nil
 }
@@ -177,15 +177,17 @@ type mcpToolAdapter struct {
 	serverName string
 	mcpTool    *mcp.Tool
 	transport  string // "stdio" (OCI/inline) or "sse" (gateway/CRD)
+	crdUIHint  string // UI hint from the AgentTool CRD (overrides heuristic detection)
 	opts       fantasy.ProviderOptions
 }
 
-func newMCPToolAdapter(session *mcp.ClientSession, serverName string, tool *mcp.Tool, transport string) *mcpToolAdapter {
+func newMCPToolAdapter(session *mcp.ClientSession, serverName string, tool *mcp.Tool, transport string, crdUIHint string) *mcpToolAdapter {
 	return &mcpToolAdapter{
 		session:    session,
 		serverName: serverName,
 		mcpTool:    tool,
 		transport:  transport,
+		crdUIHint:  crdUIHint,
 	}
 }
 
@@ -246,8 +248,14 @@ func (m *mcpToolAdapter) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 		"transport": m.transport,
 		"duration":  elapsed.Milliseconds(),
 	}
-	// Detect a UI hint from the tool/server name
-	if ui := detectMCPUIHint(m.serverName, m.mcpTool.Name); ui != "" {
+	// Add tool description from the MCP server for the frontend to render
+	if m.mcpTool.Description != "" {
+		metadata["description"] = m.mcpTool.Description
+	}
+	// UI hint: prefer CRD-configured hint, fall back to heuristic detection
+	if m.crdUIHint != "" {
+		metadata["ui"] = m.crdUIHint
+	} else if ui := detectMCPUIHint(m.serverName, m.mcpTool.Name); ui != "" {
 		metadata["ui"] = ui
 	}
 
