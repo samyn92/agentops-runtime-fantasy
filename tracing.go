@@ -320,6 +320,28 @@ func recordToolOutputEvent(span trace.Span, toolName, output string, isError boo
 	span.AddEvent("gen_ai.tool.output", trace.WithAttributes(attrs...))
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Root span context — lets tool wrappers record events on the prompt span
+// ────────────────────────────────────────────────────────────────────
+
+type rootSpanKey struct{}
+
+// withRootSpan stores the root prompt span in the context so tool wrappers
+// can record tool.call events that survive even when tool.execute spans
+// are lost by the batch exporter.
+func withRootSpan(ctx context.Context, span trace.Span) context.Context {
+	return context.WithValue(ctx, rootSpanKey{}, span)
+}
+
+// rootSpanFromContext retrieves the root prompt span stashed by withRootSpan.
+// Returns nil if none is set.
+func rootSpanFromContext(ctx context.Context) trace.Span {
+	if s, ok := ctx.Value(rootSpanKey{}).(trace.Span); ok {
+		return s
+	}
+	return nil
+}
+
 // classifyToolType returns a tool type string for span attributes.
 func classifyToolType(toolName string) string {
 	switch {

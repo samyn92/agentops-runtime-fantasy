@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"charm.land/fantasy"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // DefaultMaxToolResultChars is the default limit for tool result content.
@@ -162,6 +164,22 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 
 	// Record tool output as a span event for trace visibility
 	recordToolOutputEvent(span, toolName, result.Content, result.IsError)
+
+	// Record a compact tool.call event on the root prompt span.
+	// This survives even when individual tool.execute spans are lost
+	// by the batch exporter (common for short-lived task pods).
+	// The console UI renders these as tool rows in the trace waterfall.
+	if rootSpan := rootSpanFromContext(ctx); rootSpan != nil {
+		evAttrs := []attribute.KeyValue{
+			attribute.String("tool.name", toolName),
+			attribute.String("tool.type", classifyToolType(toolName)),
+			attribute.Int64("tool.duration_ms", elapsed.Milliseconds()),
+		}
+		if err != nil || result.IsError {
+			evAttrs = append(evAttrs, attribute.Bool("tool.error", true))
+		}
+		rootSpan.AddEvent("tool.call", trace.WithAttributes(evAttrs...))
+	}
 
 	return result, err
 }

@@ -862,6 +862,10 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 	ctx, promptSpan := tracer.Start(ctx, "agent.prompt", streamSpanOpts...)
 	defer promptSpan.End()
 
+	// Stash root span in context so tool wrappers can record tool.call events
+	// that survive even when individual tool.execute spans are lost.
+	ctx = withRootSpan(ctx, promptSpan)
+
 	// Record the user prompt as a content event for trace visibility
 	recordPromptEvent(promptSpan, req.Prompt)
 
@@ -1594,6 +1598,10 @@ func runTask() error {
 		slog.Info("delegation trace link created", "parentAgent", parentAgent, "runName", runName)
 	}
 	ctx, promptSpan := tracer.Start(ctx, "agent.prompt", spanOpts...)
+
+	// Stash root span in context so tool wrappers can record tool.call events
+	// that survive even when individual tool.execute spans are lost.
+	ctx = withRootSpan(ctx, promptSpan)
 
 	// Record the user prompt as a content event for trace visibility
 	recordPromptEvent(promptSpan, prompt)
