@@ -714,6 +714,9 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	))
 	defer promptSpan.End()
 
+	// Record the user prompt as a content event for trace visibility
+	recordPromptEvent(promptSpan, req.Prompt)
+
 	// Get messages from working memory (bounded sliding window)
 	messages := s.memory.Messages()
 
@@ -747,6 +750,9 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	output := result.Response.Content.Text()
+
+	// Record the assistant response as a content event
+	recordCompletionEvent(promptSpan, output)
 
 	// Append to working memory (sliding window — drops oldest when full)
 	s.memory.Append(fantasy.NewUserMessage(req.Prompt))
@@ -827,6 +833,9 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 		attrGenAIRequestModel.String(s.cfg.PrimaryModel),
 	))
 	defer promptSpan.End()
+
+	// Record the user prompt as a content event for trace visibility
+	recordPromptEvent(promptSpan, req.Prompt)
 
 	emit := newFEPEmitter(w)
 
@@ -1095,6 +1104,9 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 			attrGenAIOutputTokens.Int64(result.TotalUsage.OutputTokens),
 			attribute.Int("agent.steps", finalSteps),
 		)
+
+		// Record the assistant response as a content event
+		recordCompletionEvent(promptSpan, result.Response.Content.Text())
 
 		// Emit agent finish with total usage
 		emit.emitAgentFinish(s.agentName, result.TotalUsage, finalSteps, usedModel)
@@ -1531,6 +1543,9 @@ func runTask() error {
 		attrGenAIRequestModel.String(cfg.PrimaryModel),
 	))
 
+	// Record the user prompt as a content event for trace visibility
+	recordPromptEvent(promptSpan, prompt)
+
 	// Set up git workspace if GIT_REPO_URL is set (injected by operator for spec.git runs)
 	gitBranch := os.Getenv("GIT_BRANCH")
 	if repoURL := os.Getenv("GIT_REPO_URL"); repoURL != "" {
@@ -1583,6 +1598,10 @@ func runTask() error {
 
 	output := agentResult.Response.Content.Text()
 	traceID := traceIDFromContext(ctx)
+
+	// Record the assistant response as a content event
+	recordCompletionEvent(promptSpan, output)
+
 	result := taskResult{
 		Output:  output,
 		Steps:   len(agentResult.Steps),

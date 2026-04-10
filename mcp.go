@@ -264,17 +264,23 @@ func (m *mcpToolAdapter) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 	}
 
 	// Start a child span for the MCP protocol call with server-specific attributes
-	ctx, span := tracer.Start(ctx, "mcp.call")
+	prefixedName := fmt.Sprintf("mcp_%s_%s", m.serverName, m.mcpTool.Name)
+	ctx, span := tracer.Start(ctx, "mcp.call: "+m.serverName+"/"+m.mcpTool.Name)
 	defer span.End()
 
 	span.SetAttributes(
 		attrGenAIOperationName.String("execute_tool"),
 		attrToolMCPServer.String(m.serverName),
 		attrToolName.String(m.mcpTool.Name),
-		attrGenAIToolName.String(fmt.Sprintf("mcp_%s_%s", m.serverName, m.mcpTool.Name)),
+		attrGenAIToolName.String(prefixedName),
 		attrToolTransport.String(m.transport),
 		attrToolType.String("mcp"),
 	)
+
+	// Record tool input as a span event
+	if inputJSON, err := json.Marshal(args); err == nil {
+		recordToolInputEvent(span, prefixedName, string(inputJSON))
+	}
 
 	start := time.Now()
 
@@ -320,9 +326,11 @@ func (m *mcpToolAdapter) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 	if result.IsError {
 		span.SetAttributes(attrToolError.Bool(true))
 		span.SetStatus(codes.Error, "mcp tool returned error")
+		recordToolOutputEvent(span, prefixedName, text, true)
 		resp := fantasy.NewTextErrorResponse(text)
 		return fantasy.WithResponseMetadata(resp, metadata), nil
 	}
+	recordToolOutputEvent(span, prefixedName, text, false)
 	resp := fantasy.NewTextResponse(text)
 	return fantasy.WithResponseMetadata(resp, metadata), nil
 }

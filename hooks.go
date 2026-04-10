@@ -60,8 +60,8 @@ func (h *hookWrappedTool) SetProviderOptions(opts fantasy.ProviderOptions) {
 func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
 	toolName := h.inner.Info().Name
 
-	// Start a tracing span for this tool execution
-	ctx, span := tracer.Start(ctx, "tool.execute")
+	// Start a tracing span for this tool execution (name includes tool for readability)
+	ctx, span := tracer.Start(ctx, "tool.execute: "+toolName)
 	defer span.End() // BUG FIX: span was never ended before
 
 	// Set tool identity attributes at creation (important for sampling decisions)
@@ -78,6 +78,9 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 	// Parse input for inspection
 	var args map[string]any
 	_ = json.Unmarshal([]byte(call.Input), &args)
+
+	// Record tool input as a span event for trace visibility
+	recordToolInputEvent(span, toolName, call.Input)
 
 	// Before: blocked commands
 	if h.hooks != nil && toolName == "bash" && len(h.hooks.BlockedCommands) > 0 {
@@ -156,6 +159,9 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 			}
 		}
 	}
+
+	// Record tool output as a span event for trace visibility
+	recordToolOutputEvent(span, toolName, result.Content, result.IsError)
 
 	return result, err
 }

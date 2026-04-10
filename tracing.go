@@ -247,6 +247,71 @@ func detectGenAISystem(model, provider string) string {
 	return detectGenAIProvider(model, provider)
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Content events — OTel GenAI semantic convention events
+// ────────────────────────────────────────────────────────────────────
+
+// maxEventContentLen caps the content stored in span events to prevent
+// massive traces. 2000 chars ≈ 500 tokens — enough for prompt/response
+// overview without blowing up Tempo storage.
+const maxEventContentLen = 2000
+
+// truncateContent truncates s to maxLen, appending a marker if truncated.
+func truncateContent(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "... [truncated]"
+}
+
+// recordPromptEvent records the user prompt as a gen_ai.content.prompt event
+// on the given span, following the OTel GenAI semantic conventions.
+func recordPromptEvent(span trace.Span, prompt string) {
+	if prompt == "" {
+		return
+	}
+	span.AddEvent("gen_ai.content.prompt", trace.WithAttributes(
+		attribute.String("gen_ai.prompt", truncateContent(prompt, maxEventContentLen)),
+	))
+}
+
+// recordCompletionEvent records the assistant response as a gen_ai.content.completion
+// event on the given span.
+func recordCompletionEvent(span trace.Span, completion string) {
+	if completion == "" {
+		return
+	}
+	span.AddEvent("gen_ai.content.completion", trace.WithAttributes(
+		attribute.String("gen_ai.completion", truncateContent(completion, maxEventContentLen)),
+	))
+}
+
+// recordToolInputEvent records the tool input as an event on the span.
+func recordToolInputEvent(span trace.Span, toolName, input string) {
+	if input == "" {
+		return
+	}
+	span.AddEvent("gen_ai.tool.input", trace.WithAttributes(
+		attribute.String("tool.name", toolName),
+		attribute.String("tool.input", truncateContent(input, maxEventContentLen)),
+	))
+}
+
+// recordToolOutputEvent records the tool output as an event on the span.
+func recordToolOutputEvent(span trace.Span, toolName, output string, isError bool) {
+	if output == "" {
+		return
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("tool.name", toolName),
+		attribute.String("tool.output", truncateContent(output, maxEventContentLen)),
+	}
+	if isError {
+		attrs = append(attrs, attribute.Bool("tool.error", true))
+	}
+	span.AddEvent("gen_ai.tool.output", trace.WithAttributes(attrs...))
+}
+
 // classifyToolType returns a tool type string for span attributes.
 func classifyToolType(toolName string) string {
 	switch {
