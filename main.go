@@ -21,6 +21,8 @@ import (
 	"syscall"
 
 	"charm.land/fantasy"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -218,13 +220,22 @@ func buildFallbackAgent(ctx context.Context, cfg *Config, providers map[string]f
 }
 
 // streamWithFallback tries the primary model, then fallbacks on retryable errors.
+// Creates a gen_ai.stream span covering the LLM call (including fallback attempts).
 func streamWithFallback(ctx context.Context, cfg *Config, bundle *agentBundle, call fantasy.AgentStreamCall) (*fantasy.AgentResult, string, error) {
+	ctx, span := tracer.Start(ctx, "gen_ai.stream", trace.WithAttributes(
+		attrGenAIRequestModel.String(cfg.PrimaryModel),
+		attrGenAISystem.String(detectGenAISystem(cfg.PrimaryModel, cfg.PrimaryProvider)),
+	))
+	defer span.End()
+
 	result, err := bundle.agent.Stream(ctx, call)
 	if err == nil {
+		setLLMResultAttributes(span, result, cfg.PrimaryModel)
 		return result, cfg.PrimaryModel, nil
 	}
 
 	if !isRetryableError(err) || len(cfg.FallbackModels) == 0 {
+		recordError(span, err)
 		return nil, cfg.PrimaryModel, err
 	}
 
@@ -232,6 +243,13 @@ func streamWithFallback(ctx context.Context, cfg *Config, bundle *agentBundle, c
 		"model", cfg.PrimaryModel, "error", err)
 
 	for _, fbModel := range cfg.FallbackModels {
+		// Record fallback event on the span
+		span.AddEvent("model.fallback", trace.WithAttributes(
+			attribute.String("fallback.from", cfg.PrimaryModel),
+			attribute.String("fallback.to", fbModel),
+			attribute.String("fallback.error", err.Error()),
+		))
+
 		fbAgent, fbErr := buildFallbackAgent(ctx, cfg, bundle.providers, fbModel)
 		if fbErr != nil {
 			continue
@@ -239,25 +257,38 @@ func streamWithFallback(ctx context.Context, cfg *Config, bundle *agentBundle, c
 
 		result, err = fbAgent.Stream(ctx, call)
 		if err == nil {
+			span.SetAttributes(attrGenAIResponseModel.String(fbModel))
+			setLLMResultAttributes(span, result, fbModel)
 			return result, fbModel, nil
 		}
 
 		if !isRetryableError(err) {
+			recordError(span, err)
 			return nil, fbModel, err
 		}
 	}
 
+	recordError(span, err)
 	return nil, cfg.PrimaryModel, fmt.Errorf("all models failed, last error: %w", err)
 }
 
 // generateWithFallback tries the primary model, then fallbacks on retryable errors.
+// Creates a gen_ai.generate span covering the LLM call (including fallback attempts).
 func generateWithFallback(ctx context.Context, cfg *Config, bundle *agentBundle, call fantasy.AgentCall) (*fantasy.AgentResult, string, error) {
+	ctx, span := tracer.Start(ctx, "gen_ai.generate", trace.WithAttributes(
+		attrGenAIRequestModel.String(cfg.PrimaryModel),
+		attrGenAISystem.String(detectGenAISystem(cfg.PrimaryModel, cfg.PrimaryProvider)),
+	))
+	defer span.End()
+
 	result, err := bundle.agent.Generate(ctx, call)
 	if err == nil {
+		setLLMResultAttributes(span, result, cfg.PrimaryModel)
 		return result, cfg.PrimaryModel, nil
 	}
 
 	if !isRetryableError(err) || len(cfg.FallbackModels) == 0 {
+		recordError(span, err)
 		return nil, cfg.PrimaryModel, err
 	}
 
@@ -265,6 +296,13 @@ func generateWithFallback(ctx context.Context, cfg *Config, bundle *agentBundle,
 		"model", cfg.PrimaryModel, "error", err)
 
 	for _, fbModel := range cfg.FallbackModels {
+		// Record fallback event on the span
+		span.AddEvent("model.fallback", trace.WithAttributes(
+			attribute.String("fallback.from", cfg.PrimaryModel),
+			attribute.String("fallback.to", fbModel),
+			attribute.String("fallback.error", err.Error()),
+		))
+
 		fbAgent, fbErr := buildFallbackAgent(ctx, cfg, bundle.providers, fbModel)
 		if fbErr != nil {
 			slog.Warn("failed to build fallback agent", "model", fbModel, "error", fbErr)
@@ -274,15 +312,19 @@ func generateWithFallback(ctx context.Context, cfg *Config, bundle *agentBundle,
 		result, err = fbAgent.Generate(ctx, call)
 		if err == nil {
 			slog.Info("fallback model succeeded", "model", fbModel)
+			span.SetAttributes(attrGenAIResponseModel.String(fbModel))
+			setLLMResultAttributes(span, result, fbModel)
 			return result, fbModel, nil
 		}
 
 		if !isRetryableError(err) {
+			recordError(span, err)
 			return nil, fbModel, err
 		}
 		slog.Warn("fallback model failed", "model", fbModel, "error", err)
 	}
 
+	recordError(span, err)
 	return nil, cfg.PrimaryModel, fmt.Errorf("all models failed, last error: %w", err)
 }
 
@@ -326,6 +368,13 @@ func runDaemon() error {
 	agentName := os.Getenv("AGENT_NAME")
 	if agentName == "" {
 		agentName = "default"
+	}
+
+	// Initialize OpenTelemetry tracing
+	agentNamespace := os.Getenv("AGENT_NAMESPACE")
+	shutdownTracing, err := initTracing(ctx, agentName, agentNamespace, "daemon")
+	if err != nil {
+		slog.Warn("tracing init failed, continuing without tracing", "error", err)
 	}
 
 	// Initialize memory system
@@ -537,6 +586,14 @@ func runDaemon() error {
 		if srv.engram != nil {
 			srv.engram.EndSession(fantasyToEngramMessages(srv.memory.Messages()))
 		}
+
+		// Flush pending traces before exit
+		if shutdownTracing != nil {
+			if err := shutdownTracing(context.Background()); err != nil {
+				slog.Warn("tracing shutdown error", "error", err)
+			}
+		}
+
 		httpSrv.Close()
 	}()
 
@@ -571,6 +628,7 @@ type daemonServer struct {
 	activeModel  string
 	totalSteps   int
 	agentName    string // from AGENT_NAME env var
+	lastTraceID  string // trace ID of the most recent prompt execution
 	permGate     *permissionGate
 	questionGate *questionGate
 
@@ -626,6 +684,13 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	sc.mu.Unlock()
 	defer cancel()
 
+	// Start root tracing span
+	ctx, promptSpan := tracer.Start(ctx, "agent.prompt", trace.WithAttributes(
+		attrAgentName.String(s.agentName),
+		attrAgentMode.String("daemon"),
+	))
+	defer promptSpan.End()
+
 	// Get messages from working memory (bounded sliding window)
 	messages := s.memory.Messages()
 
@@ -636,7 +701,7 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.Memory != nil && s.cfg.Memory.ContextLimit > 0 {
 			contextLimit = s.cfg.Memory.ContextLimit
 		}
-		if engramCtx := s.engram.FetchContext(contextLimit); engramCtx != "" {
+		if engramCtx := s.engram.FetchContext(ctx, contextLimit); engramCtx != "" {
 			effectivePrompt = engramCtx + effectivePrompt
 		}
 	}
@@ -653,6 +718,7 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 		Messages: messages,
 	})
 	if err != nil {
+		recordError(promptSpan, err)
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
@@ -668,13 +734,24 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 
 	// Passive capture to Engram (async, fire-and-forget)
 	if s.engram != nil {
-		s.engram.PassiveCapture(output)
+		s.engram.PassiveCapture(ctx, output)
 	}
+
+	traceID := traceIDFromContext(ctx)
 
 	s.mu.Lock()
 	s.activeModel = usedModel
 	s.totalSteps += len(result.Steps)
+	s.lastTraceID = traceID
 	s.mu.Unlock()
+
+	// Set final attributes on root span
+	promptSpan.SetAttributes(
+		attrGenAIResponseModel.String(usedModel),
+		attrGenAIInputTokens.Int64(result.TotalUsage.InputTokens),
+		attrGenAIOutputTokens.Int64(result.TotalUsage.OutputTokens),
+		attribute.Int("agent.steps", len(result.Steps)),
+	)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(promptResponse{Output: output, Model: usedModel})
@@ -718,6 +795,13 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 	sc.mu.Unlock()
 	defer cancel()
 
+	// Start root tracing span for this prompt execution
+	ctx, promptSpan := tracer.Start(ctx, "agent.prompt", trace.WithAttributes(
+		attrAgentName.String(s.agentName),
+		attrAgentMode.String("daemon"),
+	))
+	defer promptSpan.End()
+
 	emit := newFEPEmitter(w)
 
 	// Store the emitter on the conversation context so permission/question
@@ -744,7 +828,7 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 		if s.cfg.Memory != nil && s.cfg.Memory.ContextLimit > 0 {
 			contextLimit = s.cfg.Memory.ContextLimit
 		}
-		if engramCtx := s.engram.FetchContext(contextLimit); engramCtx != "" {
+		if engramCtx := s.engram.FetchContext(ctx, contextLimit); engramCtx != "" {
 			effectivePrompt = engramCtx + effectivePrompt
 		}
 	}
@@ -760,8 +844,14 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 	var stepCount int
 	var stepMu sync.Mutex
 
-	// Emit agent start
-	emit.emitAgentStart(s.agentName, req.Prompt)
+	// Track active step span for proper parent-child nesting.
+	// Tool calls within a step become children of the step span.
+	var activeStepCtx context.Context
+	var activeStepSpan trace.Span
+
+	// Emit agent start with trace ID
+	traceID := traceIDFromContext(ctx)
+	emit.emitAgentStart(s.agentName, req.Prompt, traceID)
 
 	result, usedModel, err := streamWithFallback(ctx, s.cfg, s.bundle, fantasy.AgentStreamCall{
 		Prompt:   effectivePrompt,
@@ -783,6 +873,17 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 		OnStepStart: func(stepNumber int) error {
 			stepMu.Lock()
 			stepCount = stepNumber
+
+			// End previous step span if still open
+			if activeStepSpan != nil {
+				activeStepSpan.End()
+			}
+
+			// Start a new step span as child of the root prompt span
+			activeStepCtx, activeStepSpan = tracer.Start(ctx, "agent.step", trace.WithAttributes(
+				attrStepNumber.Int(stepNumber),
+				attrAgentName.String(s.agentName),
+			))
 			stepMu.Unlock()
 
 			emit.emitStepStart(stepNumber, s.agentName)
@@ -799,9 +900,29 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 		OnStepFinish: func(sr fantasy.StepResult) error {
 			stepMu.Lock()
 			currentStep := stepCount
+			stepSpan := activeStepSpan
 			stepMu.Unlock()
 
 			toolCallCount := len(sr.Content.ToolCalls())
+
+			// Set step span attributes and end it
+			if stepSpan != nil {
+				stepSpan.SetAttributes(
+					attrStepFinishReason.String(string(sr.FinishReason)),
+					attrStepToolCalls.Int(toolCallCount),
+					attrGenAIInputTokens.Int64(sr.Usage.InputTokens),
+					attrGenAIOutputTokens.Int64(sr.Usage.OutputTokens),
+				)
+				if sr.Usage.ReasoningTokens > 0 {
+					stepSpan.SetAttributes(attrGenAIReasoningTokens.Int64(sr.Usage.ReasoningTokens))
+				}
+				stepSpan.End()
+
+				stepMu.Lock()
+				activeStepSpan = nil
+				activeStepCtx = nil
+				stepMu.Unlock()
+			}
 
 			emit.emitStepFinish(currentStep, s.agentName, sr.Usage, sr.FinishReason, toolCallCount)
 			return nil
@@ -911,7 +1032,17 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 		},
 	})
 
+	// End any step span that wasn't closed (edge case: error during step)
+	stepMu.Lock()
+	if activeStepSpan != nil {
+		activeStepSpan.End()
+		activeStepSpan = nil
+	}
+	stepMu.Unlock()
+	_ = activeStepCtx // used by tool spans via context propagation
+
 	if err != nil {
+		recordError(promptSpan, err)
 		emit.emitAgentError(s.agentName, err, isRetryableError(err))
 	} else {
 		// Append to working memory (sliding window)
@@ -928,14 +1059,23 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 		s.mu.Lock()
 		s.activeModel = usedModel
 		s.totalSteps += finalSteps
+		s.lastTraceID = traceID
 		s.mu.Unlock()
+
+		// Set final attributes on root span
+		promptSpan.SetAttributes(
+			attrGenAIResponseModel.String(usedModel),
+			attrGenAIInputTokens.Int64(result.TotalUsage.InputTokens),
+			attrGenAIOutputTokens.Int64(result.TotalUsage.OutputTokens),
+			attribute.Int("agent.steps", finalSteps),
+		)
 
 		// Emit agent finish with total usage
 		emit.emitAgentFinish(s.agentName, result.TotalUsage, finalSteps, usedModel)
 
 		// Passive capture to Engram (async, fire-and-forget)
 		if s.engram != nil {
-			s.engram.PassiveCapture(result.Response.Content.Text())
+			s.engram.PassiveCapture(ctx, result.Response.Content.Text())
 		}
 	}
 
@@ -1033,6 +1173,7 @@ func (s *daemonServer) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
 	model := s.activeModel
 	steps := s.totalSteps
+	traceID := s.lastTraceID
 	s.mu.Unlock()
 
 	sc := s.convCtx
@@ -1040,8 +1181,7 @@ func (s *daemonServer) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	busy := sc.busy
 	sc.mu.Unlock()
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	resp := map[string]any{
 		"model":          model,
 		"total_steps":    steps,
 		"busy":           busy,
@@ -1049,7 +1189,13 @@ func (s *daemonServer) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		"window_size":    s.memory.WindowSize(),
 		"turns":          s.memory.TurnCount(),
 		"memory_enabled": s.engram != nil,
-	})
+	}
+	if traceID != "" {
+		resp["trace_id"] = traceID
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (s *daemonServer) handleSetWindowSize(w http.ResponseWriter, r *http.Request) {
@@ -1311,6 +1457,7 @@ type taskResult struct {
 	Model          string `json:"model"`
 	Success        bool   `json:"success"`
 	Error          string `json:"error,omitempty"`
+	TraceID        string `json:"traceID,omitempty"`
 	PullRequestURL string `json:"pullRequestURL,omitempty"`
 	Commits        int    `json:"commits,omitempty"`
 	Branch         string `json:"branch,omitempty"`
@@ -1333,11 +1480,35 @@ func runTask() error {
 		return err
 	}
 
+	// Initialize OpenTelemetry tracing
+	agentName := os.Getenv("AGENT_NAME")
+	if agentName == "" {
+		agentName = "default"
+	}
+	agentNamespace := os.Getenv("AGENT_NAMESPACE")
+	shutdownTracing, err := initTracing(ctx, agentName, agentNamespace, "task")
+	if err != nil {
+		slog.Warn("tracing init failed, continuing without tracing", "error", err)
+	}
+	defer func() {
+		if shutdownTracing != nil {
+			shutdownTracing(context.Background())
+		}
+	}()
+
+	// Start root tracing span for this task execution
+	ctx, promptSpan := tracer.Start(ctx, "agent.prompt", trace.WithAttributes(
+		attrAgentName.String(agentName),
+		attrAgentMode.String("task"),
+	))
+
 	// Set up git workspace if GIT_REPO_URL is set (injected by operator for spec.git runs)
 	gitBranch := os.Getenv("GIT_BRANCH")
 	if repoURL := os.Getenv("GIT_REPO_URL"); repoURL != "" {
 		if err := setupGitWorkspace(repoURL, gitBranch, os.Getenv("GIT_BASE_BRANCH")); err != nil {
-			result := taskResult{Success: false, Error: fmt.Sprintf("git workspace setup failed: %v", err), Branch: gitBranch}
+			recordError(promptSpan, err)
+			promptSpan.End()
+			result := taskResult{Success: false, Error: fmt.Sprintf("git workspace setup failed: %v", err), Branch: gitBranch, TraceID: traceIDFromContext(ctx)}
 			writeTaskResult(result)
 			return err
 		}
@@ -1351,10 +1522,6 @@ func runTask() error {
 	// Task agents: memory tools optional (short-lived, but can still save observations)
 	var engram *EngramClient
 	if cfg.Memory != nil {
-		agentName := os.Getenv("AGENT_NAME")
-		if agentName == "" {
-			agentName = "default"
-		}
 		project := cfg.Memory.Project
 		if project == "" {
 			project = agentName
@@ -1368,7 +1535,9 @@ func runTask() error {
 
 	bundle, err := buildAgentBundle(ctx, cfg, buildMemoryTools(engram)...)
 	if err != nil {
-		result := taskResult{Success: false, Error: err.Error(), Model: cfg.PrimaryModel}
+		recordError(promptSpan, err)
+		promptSpan.End()
+		result := taskResult{Success: false, Error: err.Error(), Model: cfg.PrimaryModel, TraceID: traceIDFromContext(ctx)}
 		writeTaskResult(result)
 		return err
 	}
@@ -1376,19 +1545,31 @@ func runTask() error {
 
 	agentResult, usedModel, err := generateWithFallback(ctx, cfg, bundle, fantasy.AgentCall{Prompt: prompt})
 	if err != nil {
-		result := taskResult{Success: false, Error: err.Error(), Model: cfg.PrimaryModel}
+		recordError(promptSpan, err)
+		promptSpan.End()
+		result := taskResult{Success: false, Error: err.Error(), Model: cfg.PrimaryModel, TraceID: traceIDFromContext(ctx)}
 		writeTaskResult(result)
 		return err
 	}
 
 	output := agentResult.Response.Content.Text()
+	traceID := traceIDFromContext(ctx)
 	result := taskResult{
 		Output:  output,
 		Steps:   len(agentResult.Steps),
 		Model:   usedModel,
 		Success: true,
+		TraceID: traceID,
 		Branch:  gitBranch,
 	}
+
+	// Set final attributes on root span
+	promptSpan.SetAttributes(
+		attrGenAIResponseModel.String(usedModel),
+		attrGenAIInputTokens.Int64(agentResult.TotalUsage.InputTokens),
+		attrGenAIOutputTokens.Int64(agentResult.TotalUsage.OutputTokens),
+		attribute.Int("agent.steps", len(agentResult.Steps)),
+	)
 
 	// Extract git info from the agent's output if this was a git workspace run
 	if os.Getenv("GIT_REPO_URL") != "" {
@@ -1408,6 +1589,7 @@ func runTask() error {
 		engram.EndSession(fantasyToEngramMessages(taskMessages))
 	}
 
+	promptSpan.End()
 	writeTaskResult(result)
 
 	return nil

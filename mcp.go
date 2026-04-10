@@ -262,6 +262,16 @@ func (m *mcpToolAdapter) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 		return fantasy.NewTextErrorResponse(fmt.Sprintf("invalid input: %s", err)), nil
 	}
 
+	// Start a child span for the MCP protocol call with server-specific attributes
+	ctx, span := tracer.Start(ctx, "mcp.call")
+	defer span.End()
+
+	span.SetAttributes(
+		attrToolMCPServer.String(m.serverName),
+		attrToolName.String(m.mcpTool.Name),
+		attrToolTransport.String(m.transport),
+	)
+
 	start := time.Now()
 
 	result, err := m.session.CallTool(ctx, &mcp.CallToolParams{
@@ -269,10 +279,13 @@ func (m *mcpToolAdapter) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 		Arguments: args,
 	})
 	if err != nil {
+		span.SetAttributes(attrToolError.Bool(true))
+		recordError(span, err)
 		return fantasy.NewTextErrorResponse(fmt.Sprintf("MCP tool call failed: %s", err)), nil
 	}
 
 	elapsed := time.Since(start)
+	span.SetAttributes(attrToolDuration.Int64(elapsed.Milliseconds()))
 
 	// Collect text content from result
 	var text string
@@ -301,6 +314,7 @@ func (m *mcpToolAdapter) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 	}
 
 	if result.IsError {
+		span.SetAttributes(attrToolError.Bool(true))
 		resp := fantasy.NewTextErrorResponse(text)
 		return fantasy.WithResponseMetadata(resp, metadata), nil
 	}

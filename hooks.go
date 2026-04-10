@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"charm.land/fantasy"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // DefaultMaxToolResultChars is the default limit for tool result content.
@@ -59,6 +60,9 @@ func (h *hookWrappedTool) SetProviderOptions(opts fantasy.ProviderOptions) {
 func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
 	toolName := h.inner.Info().Name
 
+	// Start a tracing span for this tool execution
+	ctx, span := tracer.Start(ctx, "tool.execute")
+
 	// Parse input for inspection
 	var args map[string]any
 	_ = json.Unmarshal([]byte(call.Input), &args)
@@ -68,6 +72,8 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 		cmd, _ := args["command"].(string)
 		for _, blocked := range h.hooks.BlockedCommands {
 			if strings.Contains(cmd, blocked) {
+				span.SetAttributes(attrToolError.Bool(true))
+				span.SetStatus(codes.Error, "blocked command")
 				return fantasy.NewTextErrorResponse(
 					fmt.Sprintf("Blocked command pattern: %s", blocked)), nil
 			}
@@ -86,14 +92,28 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 				}
 			}
 			if !allowed {
+				span.SetAttributes(attrToolError.Bool(true))
+				span.SetStatus(codes.Error, "path not allowed")
 				return fantasy.NewTextErrorResponse(
 					fmt.Sprintf("Path not in allowed list: %s", path)), nil
 			}
 		}
 	}
 
-	// Execute
+	// Execute with timing
+	start := time.Now()
 	result, err := h.inner.Run(ctx, call)
+	elapsed := time.Since(start)
+
+	span.SetAttributes(attrToolDuration.Int64(elapsed.Milliseconds()))
+
+	if err != nil {
+		span.SetAttributes(attrToolError.Bool(true))
+		recordError(span, err)
+	} else if result.IsError {
+		span.SetAttributes(attrToolError.Bool(true))
+		span.SetStatus(codes.Error, "tool returned error")
+	}
 
 	// After: truncate large tool results to prevent context window blowup.
 	// Applied before audit logging so the log reflects the truncated state.

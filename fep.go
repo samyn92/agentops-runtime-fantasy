@@ -58,11 +58,15 @@ func (e *fepEmitter) emit(eventType string, fields map[string]any) {
 // Agent lifecycle events
 // --------------------------------------------------------------------
 
-func (e *fepEmitter) emitAgentStart(sessionId, prompt string) {
-	e.emit("agent_start", map[string]any{
+func (e *fepEmitter) emitAgentStart(sessionId, prompt string, traceID string) {
+	fields := map[string]any{
 		"session_id": sessionId,
 		"prompt":     prompt,
-	})
+	}
+	if traceID != "" {
+		fields["trace_id"] = traceID
+	}
+	e.emit("agent_start", fields)
 }
 
 func (e *fepEmitter) emitAgentFinish(sessionId string, totalUsage fantasy.Usage, stepCount int, model string) {

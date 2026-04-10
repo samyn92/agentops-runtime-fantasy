@@ -238,10 +238,17 @@ func (ec *EngramClient) Init() error {
 // FetchContext retrieves recent context from Engram (short-term + long-term memories).
 // Returns a formatted string suitable for prepending to the system context.
 // Returns empty string on error or if no context is available.
-func (ec *EngramClient) FetchContext(limit int) string {
+func (ec *EngramClient) FetchContext(ctx context.Context, limit int) string {
 	if ec == nil {
 		return ""
 	}
+
+	ctx, span := tracer.Start(ctx, "engram.fetch_context")
+	defer span.End()
+	span.SetAttributes(
+		attrEngramOp.String("fetch_context"),
+		attrEngramProject.String(ec.project),
+	)
 
 	params := url.Values{
 		"project": {ec.project},
@@ -251,6 +258,7 @@ func (ec *EngramClient) FetchContext(limit int) string {
 	resp, err := ec.get("/context", params)
 	if err != nil {
 		slog.Warn("engram fetch context failed", "error", err)
+		recordError(span, err)
 		return ""
 	}
 
@@ -313,10 +321,17 @@ func (ec *EngramClient) FetchContext(limit int) string {
 
 // SaveObservation explicitly saves an observation (long-term memory).
 // Types: "decision", "discovery", "bugfix", "lesson", "procedure"
-func (ec *EngramClient) SaveObservation(obsType, title, content string, tags []string) error {
+func (ec *EngramClient) SaveObservation(ctx context.Context, obsType, title, content string, tags []string) error {
 	if ec == nil {
 		return nil
 	}
+
+	ctx, span := tracer.Start(ctx, "engram.save_observation")
+	defer span.End()
+	span.SetAttributes(
+		attrEngramOp.String("save_observation"),
+		attrEngramProject.String(ec.project),
+	)
 
 	body := map[string]any{
 		"session_id": ec.sessionID,
@@ -331,6 +346,7 @@ func (ec *EngramClient) SaveObservation(obsType, title, content string, tags []s
 
 	_, err := ec.post("/observations", body)
 	if err != nil {
+		recordError(span, err)
 		return fmt.Errorf("engram save observation: %w", err)
 	}
 
@@ -341,7 +357,7 @@ func (ec *EngramClient) SaveObservation(obsType, title, content string, tags []s
 // PassiveCapture sends assistant output for Engram's passive extraction.
 // Engram auto-detects noteworthy content (decisions, discoveries, etc.)
 // and stores it. Fire-and-forget — errors are logged but not propagated.
-func (ec *EngramClient) PassiveCapture(assistantOutput string) {
+func (ec *EngramClient) PassiveCapture(ctx context.Context, assistantOutput string) {
 	if ec == nil || assistantOutput == "" {
 		return
 	}
@@ -353,6 +369,9 @@ func (ec *EngramClient) PassiveCapture(assistantOutput string) {
 	}
 
 	go func() {
+		_, captureCtx := tracer.Start(ctx, "engram.passive_capture")
+		_ = captureCtx // span ends when goroutine finishes
+
 		_, err := ec.post("/observations/passive", body)
 		if err != nil {
 			slog.Debug("engram passive capture failed", "error", err)
@@ -419,10 +438,17 @@ func fantasyToEngramMessages(messages []fantasy.Message) []EngramSessionMessage 
 }
 
 // Search performs a full-text search across memories.
-func (ec *EngramClient) Search(query string, limit int) ([]EngramSearchResult, error) {
+func (ec *EngramClient) Search(ctx context.Context, query string, limit int) ([]EngramSearchResult, error) {
 	if ec == nil {
 		return nil, nil
 	}
+
+	ctx, span := tracer.Start(ctx, "engram.search")
+	defer span.End()
+	span.SetAttributes(
+		attrEngramOp.String("search"),
+		attrEngramProject.String(ec.project),
+	)
 
 	params := url.Values{
 		"q":       {query},
@@ -434,6 +460,7 @@ func (ec *EngramClient) Search(query string, limit int) ([]EngramSearchResult, e
 
 	resp, err := ec.get("/search", params)
 	if err != nil {
+		recordError(span, err)
 		return nil, fmt.Errorf("engram search: %w", err)
 	}
 
@@ -530,7 +557,7 @@ type memSaveInput struct {
 func newMemSaveTool(engram *EngramClient) fantasy.AgentTool {
 	return fantasy.NewAgentTool("mem_save",
 		"Save an observation to long-term memory (Engram). Use this proactively to remember important decisions, discoveries, bugfixes, patterns, and lessons learned. These memories persist across conversations and restarts.",
-		func(_ context.Context, input memSaveInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+		func(ctx context.Context, input memSaveInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if input.Title == "" || input.Content == "" {
 				return fantasy.NewTextErrorResponse("title and content are required"), nil
 			}
@@ -538,7 +565,7 @@ func newMemSaveTool(engram *EngramClient) fantasy.AgentTool {
 				input.Type = "discovery"
 			}
 
-			err := engram.SaveObservation(input.Type, input.Title, input.Content, input.Tags)
+			err := engram.SaveObservation(ctx, input.Type, input.Title, input.Content, input.Tags)
 			if err != nil {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("failed to save memory: %s", err)), nil
 			}
@@ -557,7 +584,7 @@ type memSearchInput struct {
 func newMemSearchTool(engram *EngramClient) fantasy.AgentTool {
 	return fantasy.NewAgentTool("mem_search",
 		"Search long-term memory (Engram) using full-text search. Returns matching observations ranked by relevance. Use this to recall past decisions, discoveries, bugfixes, and lessons.",
-		func(_ context.Context, input memSearchInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+		func(ctx context.Context, input memSearchInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if input.Query == "" {
 				return fantasy.NewTextErrorResponse("query is required"), nil
 			}
@@ -566,7 +593,7 @@ func newMemSearchTool(engram *EngramClient) fantasy.AgentTool {
 				limit = 10
 			}
 
-			results, err := engram.Search(input.Query, limit)
+			results, err := engram.Search(ctx, input.Query, limit)
 			if err != nil {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("search failed: %s", err)), nil
 			}
@@ -595,17 +622,17 @@ type memContextInput struct {
 func newMemContextTool(engram *EngramClient) fantasy.AgentTool {
 	return fantasy.NewAgentTool("mem_context",
 		"Retrieve recent memory context from Engram — recent observations and session summaries. Use this to refresh your knowledge about what happened in previous sessions.",
-		func(_ context.Context, input memContextInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+		func(ctx context.Context, input memContextInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			limit := input.Limit
 			if limit <= 0 {
 				limit = 5
 			}
 
-			ctx := engram.FetchContext(limit)
-			if ctx == "" {
+			memCtx := engram.FetchContext(ctx, limit)
+			if memCtx == "" {
 				return fantasy.NewTextResponse("No recent memory context available."), nil
 			}
 
-			return fantasy.NewTextResponse(ctx), nil
+			return fantasy.NewTextResponse(memCtx), nil
 		})
 }
