@@ -1439,7 +1439,8 @@ type runAgentInput struct {
 // the cluster.
 func buildRunAgentDescription(resources []ResourceEntry) string {
 	base := "Delegate a task to another agent. Creates an AgentRun tracked by the operator. " +
-		"Use get_agent_run to poll for completion."
+		"IMPORTANT: After calling run_agent, report back to the user that the task has been delegated " +
+		"and offer to check on it later. Do NOT automatically call get_agent_run — let the user decide when to check."
 
 	// Build git resource list
 	var gitResources []string
@@ -1567,7 +1568,7 @@ func newRunAgentTool(k8s *K8sClient, resources []ResourceEntry) fantasy.AgentToo
 				modeHint += fmt.Sprintf(" Git workspace: resource=%s branch=%s.", gitParams.ResourceRef, gitParams.Branch)
 			}
 
-			resp := fantasy.NewTextResponse(fmt.Sprintf("AgentRun %s created for agent %q.%s Use get_agent_run with name=%q to check progress.", run.Name, input.Agent, modeHint, run.Name))
+			resp := fantasy.NewTextResponse(fmt.Sprintf("AgentRun %s created for agent %q.%s\n\nTell the user the task has been delegated. They can ask you to check on it anytime with get_agent_run name=%q.", run.Name, input.Agent, modeHint, run.Name))
 			resp = fantasy.WithResponseMetadata(resp, map[string]any{
 				"ui":        "agent-run",
 				"agent":     input.Agent,
@@ -1627,7 +1628,7 @@ func newGetAgentRunTool(k8s *K8sClient) fantasy.AgentTool {
 
 			// Hint if still running
 			if status.Phase == "Running" || status.Phase == "Pending" || status.Phase == "Queued" || status.Phase == "Unknown" {
-				text += "\n\n(Run is still in progress. Call get_agent_run again to check for completion.)"
+				text += "\n\n(Run is still in progress. Report this to the user — they can ask you to check again later.)"
 			}
 
 			metadata := map[string]any{
