@@ -1039,6 +1039,9 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 				mediaData = v.Data
 			}
 
+			// Persist metadata so it survives working memory serialization
+			s.memory.StoreToolMeta(tr.ToolCallID, tr.ClientMetadata)
+
 			emit.emitToolResult(tr.ToolCallID, tr.ToolName, outputText, isError, tr.ClientMetadata, mediaType, mediaData)
 			return nil
 		},
@@ -1292,6 +1295,7 @@ type serializablePart struct {
 	Input            string                  `json:"input,omitempty"`
 	ProviderExecuted bool                    `json:"provider_executed,omitempty"`
 	Output           *serializableToolOutput `json:"output,omitempty"`
+	Metadata         string                  `json:"metadata,omitempty"` // ClientMetadata JSON for tool-result parts
 }
 
 // serializableMessage mirrors the frontend RuntimeMessage type.
@@ -1302,6 +1306,7 @@ type serializableMessage struct {
 
 func (s *daemonServer) handleGetWorkingMemory(w http.ResponseWriter, r *http.Request) {
 	messages := s.memory.Messages()
+	toolMeta := s.memory.ToolMeta()
 
 	result := make([]serializableMessage, 0, len(messages))
 	for _, msg := range messages {
@@ -1340,6 +1345,7 @@ func (s *daemonServer) handleGetWorkingMemory(w http.ResponseWriter, r *http.Req
 				sp := serializablePart{
 					Type:       "tool-result",
 					ToolCallID: p.ToolCallID,
+					Metadata:   toolMeta[p.ToolCallID],
 				}
 				switch v := p.Output.(type) {
 				case fantasy.ToolResultOutputContentText:

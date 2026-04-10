@@ -22,6 +22,7 @@ const checkpointPath = "/data/sessions/checkpoint.json"
 type checkpointData struct {
 	TurnNum  int                   `json:"turnNum"`
 	Messages []serializableMessage `json:"messages"`
+	ToolMeta map[string]string     `json:"toolMeta,omitempty"` // toolCallID → ClientMetadata JSON
 }
 
 // SaveCheckpoint serializes the working memory to disk.
@@ -38,7 +39,8 @@ func (wm *WorkingMemory) SaveCheckpoint() {
 
 	data := checkpointData{
 		TurnNum:  wm.turnNum,
-		Messages: serializeMessages(wm.messages),
+		Messages: serializeMessages(wm.messages, wm.toolMeta),
+		ToolMeta: wm.toolMeta,
 	}
 
 	raw, err := json.Marshal(data)
@@ -94,6 +96,9 @@ func (wm *WorkingMemory) RestoreCheckpoint() int {
 	defer wm.mu.Unlock()
 	wm.messages = messages
 	wm.turnNum = data.TurnNum
+	if data.ToolMeta != nil {
+		wm.toolMeta = data.ToolMeta
+	}
 
 	slog.Info("working memory restored from checkpoint",
 		"messages", len(messages),
@@ -114,7 +119,8 @@ func RemoveCheckpoint() {
 
 // serializeMessages converts Fantasy messages to the JSON-safe format.
 // Reuses the serializableMessage types from handleGetWorkingMemory.
-func serializeMessages(messages []fantasy.Message) []serializableMessage {
+// toolMeta is the side-map of toolCallID → ClientMetadata JSON.
+func serializeMessages(messages []fantasy.Message, toolMeta map[string]string) []serializableMessage {
 	result := make([]serializableMessage, 0, len(messages))
 	for _, msg := range messages {
 		sm := serializableMessage{
@@ -152,6 +158,7 @@ func serializeMessages(messages []fantasy.Message) []serializableMessage {
 				sp := serializablePart{
 					Type:       "tool-result",
 					ToolCallID: p.ToolCallID,
+					Metadata:   toolMeta[p.ToolCallID],
 				}
 				switch v := p.Output.(type) {
 				case fantasy.ToolResultOutputContentText:

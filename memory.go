@@ -44,6 +44,12 @@ type WorkingMemory struct {
 	messages []fantasy.Message
 	maxSize  int
 	turnNum  int // number of completed turns (user prompt + assistant response)
+
+	// toolMeta maps toolCallID → ClientMetadata JSON string.
+	// Populated from OnToolResult callbacks; persisted in checkpoints.
+	// Used to enrich tool-result parts during serialization since
+	// Fantasy's ToolResultPart doesn't carry ClientMetadata.
+	toolMeta map[string]string
 }
 
 // NewWorkingMemory creates a working memory with the given window size.
@@ -54,6 +60,7 @@ func NewWorkingMemory(windowSize int) *WorkingMemory {
 	return &WorkingMemory{
 		messages: make([]fantasy.Message, 0, windowSize),
 		maxSize:  windowSize,
+		toolMeta: make(map[string]string),
 	}
 }
 
@@ -63,6 +70,28 @@ func (wm *WorkingMemory) Messages() []fantasy.Message {
 	defer wm.mu.RUnlock()
 	out := make([]fantasy.Message, len(wm.messages))
 	copy(out, wm.messages)
+	return out
+}
+
+// StoreToolMeta records the ClientMetadata JSON for a tool call ID.
+// Called from OnToolResult so it can be re-attached during serialization.
+func (wm *WorkingMemory) StoreToolMeta(toolCallID, metadata string) {
+	if toolCallID == "" || metadata == "" {
+		return
+	}
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+	wm.toolMeta[toolCallID] = metadata
+}
+
+// ToolMeta returns a snapshot of the tool metadata map.
+func (wm *WorkingMemory) ToolMeta() map[string]string {
+	wm.mu.RLock()
+	defer wm.mu.RUnlock()
+	out := make(map[string]string, len(wm.toolMeta))
+	for k, v := range wm.toolMeta {
+		out[k] = v
+	}
 	return out
 }
 
