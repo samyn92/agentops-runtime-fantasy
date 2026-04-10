@@ -222,17 +222,24 @@ func setLLMResultAttributes(span trace.Span, result *fantasy.AgentResult, model 
 	recordToolCallEventsFromSteps(span, result.Steps)
 }
 
+// maxToolEventContentLen caps tool input/output stored in tool.call events.
+// Smaller than maxEventContentLen since there can be many tool calls per span.
+const maxToolEventContentLen = 1000
+
 // recordToolCallEventsFromSteps iterates agent steps and records a tool.call
 // event for every tool invocation found in the step response content. Each
-// event carries the tool name, type, step number, and error status so the
-// console UI can render a compact waterfall without needing the full
-// tool.execute child spans (which are often lost by the batch exporter in
-// short-lived task pods).
+// event carries the tool name, type, step number, input args, output text,
+// and error status so the console UI can render a deep-inspection detail
+// panel when clicking a tool row in the trace waterfall.
 func recordToolCallEventsFromSteps(span trace.Span, steps []fantasy.StepResult) {
 	toolCount := 0
 	for stepIdx, step := range steps {
-		// Collect tool call IDs that had error results so we can flag them.
-		errorCalls := make(map[string]bool)
+		// First pass: collect tool results keyed by call ID.
+		type toolResult struct {
+			output  string
+			isError bool
+		}
+		results := make(map[string]toolResult)
 		for _, content := range step.Content {
 			if content.GetType() != fantasy.ContentTypeToolResult {
 				continue
@@ -241,12 +248,24 @@ func recordToolCallEventsFromSteps(span trace.Span, steps []fantasy.StepResult) 
 			if !ok {
 				continue
 			}
-			if tr.Result != nil && tr.Result.GetType() == fantasy.ToolResultContentTypeError {
-				errorCalls[tr.ToolCallID] = true
+			res := toolResult{}
+			if tr.Result != nil {
+				switch tr.Result.GetType() {
+				case fantasy.ToolResultContentTypeText:
+					if txt, ok := fantasy.AsToolResultOutputType[fantasy.ToolResultOutputContentText](tr.Result); ok {
+						res.output = txt.Text
+					}
+				case fantasy.ToolResultContentTypeError:
+					res.isError = true
+					if errResult, ok := fantasy.AsToolResultOutputType[fantasy.ToolResultOutputContentError](tr.Result); ok && errResult.Error != nil {
+						res.output = errResult.Error.Error()
+					}
+				}
 			}
+			results[tr.ToolCallID] = res
 		}
 
-		// Now record tool.call events for each tool call in this step.
+		// Second pass: record tool.call events with input + output.
 		for _, content := range step.Content {
 			if content.GetType() != fantasy.ContentTypeToolCall {
 				continue
@@ -260,9 +279,22 @@ func recordToolCallEventsFromSteps(span trace.Span, steps []fantasy.StepResult) 
 				attribute.String("tool.type", classifyToolType(tc.ToolName)),
 				attribute.Int("tool.step", stepIdx+1),
 			}
-			if errorCalls[tc.ToolCallID] {
-				evAttrs = append(evAttrs, attribute.Bool("tool.error", true))
+
+			// Include tool input (JSON args) — the deep inspection data.
+			if tc.Input != "" {
+				evAttrs = append(evAttrs, attribute.String("tool.input", truncateContent(tc.Input, maxToolEventContentLen)))
 			}
+
+			// Include tool output if we have a matching result.
+			if res, ok := results[tc.ToolCallID]; ok {
+				if res.isError {
+					evAttrs = append(evAttrs, attribute.Bool("tool.error", true))
+				}
+				if res.output != "" {
+					evAttrs = append(evAttrs, attribute.String("tool.output", truncateContent(res.output, maxToolEventContentLen)))
+				}
+			}
+
 			span.AddEvent("tool.call", trace.WithAttributes(evAttrs...))
 			toolCount++
 		}
