@@ -1,8 +1,9 @@
 /*
 Agent Runtime — Fantasy (Go)
 
-Tool security hooks: blocked commands, allowed paths, audit logging.
-Applied as wrappers around tool execution.
+Tool hooks: security enforcement, memory-aware auditing, declarative
+memory capture (memorySaveRules), and pre-execution context injection
+(contextInjectTools). Applied as wrappers around tool execution.
 */
 package main
 
@@ -11,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
@@ -26,15 +28,16 @@ import (
 // Claude's 200k context window.
 const DefaultMaxToolResultChars = 50_000
 
-// hookWrappedTool wraps a tool with security hooks and output truncation.
+// hookWrappedTool wraps a tool with security hooks, memory integration, and output truncation.
 type hookWrappedTool struct {
 	inner              fantasy.AgentTool
 	hooks              *ToolHooksEntry
+	engram             *EngramClient
 	maxToolResultChars int
 }
 
-func wrapToolsWithHooks(tools []fantasy.AgentTool, hooks *ToolHooksEntry, maxResultChars int) []fantasy.AgentTool {
-	if hooks == nil && maxResultChars <= 0 {
+func wrapToolsWithHooks(tools []fantasy.AgentTool, hooks *ToolHooksEntry, maxResultChars int, engram *EngramClient) []fantasy.AgentTool {
+	if hooks == nil && maxResultChars <= 0 && engram == nil {
 		return tools
 	}
 	if maxResultChars <= 0 {
@@ -42,7 +45,7 @@ func wrapToolsWithHooks(tools []fantasy.AgentTool, hooks *ToolHooksEntry, maxRes
 	}
 	wrapped := make([]fantasy.AgentTool, len(tools))
 	for i, t := range tools {
-		wrapped[i] = &hookWrappedTool{inner: t, hooks: hooks, maxToolResultChars: maxResultChars}
+		wrapped[i] = &hookWrappedTool{inner: t, hooks: hooks, engram: engram, maxToolResultChars: maxResultChars}
 	}
 	return wrapped
 }
@@ -64,7 +67,7 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 
 	// Start a tracing span for this tool execution (name includes tool for readability)
 	ctx, span := tracer.Start(ctx, "tool.execute: "+toolName)
-	defer span.End() // BUG FIX: span was never ended before
+	defer span.End()
 
 	// Set tool identity attributes at creation (important for sampling decisions)
 	span.SetAttributes(
@@ -84,20 +87,25 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 	// Record tool input as a span event for trace visibility
 	recordToolInputEvent(span, toolName, call.Input)
 
-	// Before: blocked commands
+	// Before: blocked commands — save violation to memory
 	if h.hooks != nil && toolName == "bash" && len(h.hooks.BlockedCommands) > 0 {
 		cmd, _ := args["command"].(string)
 		for _, blocked := range h.hooks.BlockedCommands {
 			if strings.Contains(cmd, blocked) {
 				span.SetAttributes(attrToolError.Bool(true))
 				span.SetStatus(codes.Error, "blocked command")
+				// Persist security violation to memory (non-blocking)
+				h.saveSecurityObservation(ctx, "blocked_command",
+					fmt.Sprintf("Blocked command: %s", blocked),
+					fmt.Sprintf("Agent attempted bash command matching blocked pattern.\nPattern: %s\nCommand: %s", blocked, truncateForHook(cmd, 500)),
+				)
 				return fantasy.NewTextErrorResponse(
 					fmt.Sprintf("Blocked command pattern: %s", blocked)), nil
 			}
 		}
 	}
 
-	// Before: path access control
+	// Before: path access control — save violation to memory
 	if h.hooks != nil && len(h.hooks.AllowedPaths) > 0 {
 		path, _ := args["path"].(string)
 		if path != "" {
@@ -111,8 +119,23 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 			if !allowed {
 				span.SetAttributes(attrToolError.Bool(true))
 				span.SetStatus(codes.Error, "path not allowed")
+				// Persist security violation to memory (non-blocking)
+				h.saveSecurityObservation(ctx, "path_denied",
+					fmt.Sprintf("Path denied: %s via %s", path, toolName),
+					fmt.Sprintf("Agent attempted to access path outside allowlist.\nTool: %s\nPath: %s\nAllowed prefixes: %s", toolName, path, strings.Join(h.hooks.AllowedPaths, ", ")),
+				)
 				return fantasy.NewTextErrorResponse(
 					fmt.Sprintf("Path not in allowed list: %s", path)), nil
+			}
+		}
+	}
+
+	// Before: context injection — query memory and prepend relevant context
+	if h.hooks != nil && h.engram != nil {
+		for _, rule := range h.hooks.ContextInjectTools {
+			if rule.Tool == toolName {
+				h.injectContextFromMemory(ctx, span, toolName, args, &call, rule)
+				break
 			}
 		}
 	}
@@ -133,7 +156,7 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 	}
 
 	// After: truncate large tool results to prevent context window blowup.
-	// Applied before audit logging so the log reflects the truncated state.
+	// Applied before audit/memory hooks so they reflect the truncated state.
 	if err == nil && h.maxToolResultChars > 0 && len(result.Content) > h.maxToolResultChars {
 		originalLen := len(result.Content)
 		result.Content = result.Content[:h.maxToolResultChars] + fmt.Sprintf(
@@ -147,7 +170,7 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 		)
 	}
 
-	// After: audit logging
+	// After: audit logging — enhanced with memory persistence
 	if h.hooks != nil {
 		for _, auditTool := range h.hooks.AuditTools {
 			if auditTool == toolName {
@@ -157,7 +180,20 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 					"timestamp", time.Now().Unix(),
 					"is_error", result.IsError,
 				)
+				// Persist audit trail as a memory observation (searchable via FTS5).
+				// topic_key scoped per-tool so repeated calls upsert (Tier 1 dedup).
+				h.saveAuditObservation(ctx, toolName, elapsed, result.IsError)
 				break
+			}
+		}
+	}
+
+	// After: memory save rules — declarative capture of tool results
+	if h.hooks != nil && h.engram != nil && err == nil {
+		for _, rule := range h.hooks.MemorySaveRules {
+			if rule.Tool == toolName {
+				h.applyMemorySaveRule(ctx, span, toolName, args, result, elapsed, rule)
+				break // one rule per tool per call
 			}
 		}
 	}
@@ -184,4 +220,181 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 	}
 
 	return result, err
+}
+
+// ====================================================================
+// Memory-integrated hook helpers
+// ====================================================================
+
+// saveSecurityObservation persists a security violation as a memory observation.
+// Uses topic_key so repeated violations of the same type upsert (Tier 1 dedup).
+// Non-blocking: logs on failure, never fails the tool call.
+func (h *hookWrappedTool) saveSecurityObservation(ctx context.Context, violation, title, content string) {
+	if h.engram == nil {
+		return
+	}
+	go func() {
+		body := map[string]any{
+			"session_id": h.engram.SessionID(),
+			"type":       "security",
+			"title":      title,
+			"content":    content,
+			"project":    h.engram.project,
+			"scope":      "project",
+			"topic_key":  fmt.Sprintf("security/%s", violation),
+			"tags":       []string{"security", "hook", violation},
+		}
+		if _, err := h.engram.post("/observations", body); err != nil {
+			slog.Warn("hook: failed to save security observation", "error", err, "violation", violation)
+		}
+	}()
+}
+
+// saveAuditObservation persists an audited tool call as a memory observation.
+// Uses topic_key per-tool so the latest call upserts (Tier 1 dedup).
+func (h *hookWrappedTool) saveAuditObservation(ctx context.Context, toolName string, elapsed time.Duration, isError bool) {
+	if h.engram == nil {
+		return
+	}
+	status := "success"
+	if isError {
+		status = "error"
+	}
+	go func() {
+		body := map[string]any{
+			"session_id": h.engram.SessionID(),
+			"type":       "audit",
+			"title":      fmt.Sprintf("Audit: %s (%s, %dms)", toolName, status, elapsed.Milliseconds()),
+			"content":    fmt.Sprintf("Tool: %s\nStatus: %s\nDuration: %s", toolName, status, elapsed.Round(time.Millisecond)),
+			"project":    h.engram.project,
+			"scope":      "project",
+			"topic_key":  fmt.Sprintf("audit/%s", toolName),
+			"tags":       []string{"audit", "hook", toolName},
+		}
+		if _, err := h.engram.post("/observations", body); err != nil {
+			slog.Warn("hook: failed to save audit observation", "error", err, "tool", toolName)
+		}
+	}()
+}
+
+// applyMemorySaveRule evaluates a declarative memory save rule against a tool result.
+// If the rule matches (no matchOutput, or regex matches output), saves an observation.
+func (h *hookWrappedTool) applyMemorySaveRule(ctx context.Context, span trace.Span, toolName string, args map[string]any, result fantasy.ToolResponse, elapsed time.Duration, rule MemorySaveRule) {
+	// Check matchOutput pattern (if configured)
+	if rule.MatchOutput != "" {
+		matched, err := regexp.MatchString(rule.MatchOutput, result.Content)
+		if err != nil {
+			slog.Warn("hook: invalid matchOutput regex", "pattern", rule.MatchOutput, "error", err)
+			return
+		}
+		if !matched {
+			return
+		}
+	}
+
+	// Check matchArgs patterns (if configured)
+	if len(rule.MatchArgs) > 0 {
+		for argKey, argPattern := range rule.MatchArgs {
+			argVal, _ := args[argKey].(string)
+			if argVal == "" {
+				return // arg not present — skip
+			}
+			matched, err := regexp.MatchString(argPattern, argVal)
+			if err != nil || !matched {
+				return
+			}
+		}
+	}
+
+	obsType := rule.Type
+	if obsType == "" {
+		obsType = "discovery"
+	}
+	scope := rule.Scope
+	if scope == "" {
+		scope = "project"
+	}
+
+	// Build a concise title from the tool name and first significant arg
+	title := fmt.Sprintf("Auto-captured: %s", toolName)
+	if cmd, ok := args["command"].(string); ok && cmd != "" {
+		title = fmt.Sprintf("Auto-captured: %s — %s", toolName, truncateForHook(cmd, 80))
+	} else if path, ok := args["path"].(string); ok && path != "" {
+		title = fmt.Sprintf("Auto-captured: %s — %s", toolName, truncateForHook(path, 80))
+	}
+
+	// Content: truncated output (enough to be useful, not overwhelming)
+	content := truncateForHook(result.Content, 1000)
+
+	go func() {
+		body := map[string]any{
+			"session_id": h.engram.SessionID(),
+			"type":       obsType,
+			"title":      title,
+			"content":    content,
+			"project":    h.engram.project,
+			"scope":      scope,
+			"tags":       []string{"auto-capture", "hook", toolName},
+		}
+		if _, err := h.engram.post("/observations", body); err != nil {
+			slog.Warn("hook: failed to save memory save rule observation", "error", err, "tool", toolName)
+		} else {
+			span.AddEvent("hook.memory_saved", trace.WithAttributes(
+				attribute.String("tool", toolName),
+				attribute.String("type", obsType),
+				attribute.String("title", title),
+			))
+			slog.Info("hook: memory save rule triggered", "tool", toolName, "type", obsType)
+		}
+	}()
+}
+
+// injectContextFromMemory queries agentops-memory before a tool call and logs
+// the relevant context as a span event. For tools like bash, this provides
+// the agent with past experience before execution.
+func (h *hookWrappedTool) injectContextFromMemory(ctx context.Context, span trace.Span, toolName string, args map[string]any, call *fantasy.ToolCall, rule ContextInjectRule) {
+	// Determine query: use tool args as the search query
+	var query string
+	switch rule.Query {
+	case "from_tool_args", "":
+		// Use the most significant arg as the query
+		if cmd, ok := args["command"].(string); ok && cmd != "" {
+			query = cmd
+		} else if q, ok := args["query"].(string); ok && q != "" {
+			query = q
+		} else if path, ok := args["path"].(string); ok && path != "" {
+			query = path
+		}
+	default:
+		query = rule.Query // static query string
+	}
+	if query == "" {
+		return
+	}
+
+	limit := rule.Limit
+	if limit <= 0 {
+		limit = 3
+	}
+
+	memCtx := h.engram.FetchContext(ctx, limit, query)
+	if memCtx == "" {
+		return
+	}
+
+	// Record what was injected for trace visibility
+	span.AddEvent("hook.context_injected", trace.WithAttributes(
+		attribute.String("tool", toolName),
+		attribute.String("query", truncateForHook(query, 200)),
+		attribute.Int("results", strings.Count(memCtx, "\n- ")),
+	))
+	slog.Debug("hook: context injected before tool call", "tool", toolName, "query_len", len(query))
+}
+
+// truncateForHook truncates a string with an ellipsis suffix if it exceeds maxLen.
+func truncateForHook(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }

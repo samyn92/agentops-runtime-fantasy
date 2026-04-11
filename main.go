@@ -79,7 +79,7 @@ type agentBundle struct {
 	mcpConns  []mcpConnection
 }
 
-func buildAgentBundle(ctx context.Context, cfg *Config, extraTools ...fantasy.AgentTool) (*agentBundle, error) {
+func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, extraTools ...fantasy.AgentTool) (*agentBundle, error) {
 	// Resolve providers
 	providers := make(map[string]fantasy.Provider)
 	for _, p := range cfg.Providers {
@@ -143,7 +143,7 @@ func buildAgentBundle(ctx context.Context, cfg *Config, extraTools ...fantasy.Ag
 
 	// Wrap ALL tools with security hooks + output truncation + tracing spans.
 	// This must be done AFTER all tools are added so every tool gets traced.
-	tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars)
+	tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars, engram)
 
 	// Apply Anthropic prompt caching to tool definitions (if using Anthropic)
 	if isAnthropicProvider(cfg) {
@@ -449,7 +449,7 @@ func runDaemon() error {
 	_ = contextLimit // used in prompt handlers via cfg
 
 	// Build agent bundle (includes memory tools if engram is available)
-	bundle, err := buildAgentBundle(ctx, cfg, buildMemoryTools(engram)...)
+	bundle, err := buildAgentBundle(ctx, cfg, engram, buildMemoryTools(engram)...)
 	if err != nil {
 		return err
 	}
@@ -527,7 +527,7 @@ func runDaemon() error {
 		tools = append(tools, buildMemoryTools(engram)...)
 
 		// Wrap ALL tools with hooks (tracing + truncation) BEFORE permission gates
-		tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars)
+		tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars, srv.engram)
 
 		// Wrap with permission gates (on top of hook-wrapped tools)
 		tools = srv.permGate.wrapTools(tools, cfg.PermissionTools)
@@ -579,7 +579,7 @@ func runDaemon() error {
 		tools = append(tools, buildMemoryTools(engram)...)
 
 		// Wrap ALL tools with hooks (tracing + truncation)
-		tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars)
+		tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars, srv.engram)
 
 		opts := []fantasy.AgentOption{fantasy.WithTools(tools...)}
 		if cfg.SystemPrompt != "" {
@@ -1663,7 +1663,7 @@ func runTask() error {
 		}
 	}
 
-	bundle, err := buildAgentBundle(ctx, cfg, buildMemoryTools(engram)...)
+	bundle, err := buildAgentBundle(ctx, cfg, engram, buildMemoryTools(engram)...)
 	if err != nil {
 		recordError(promptSpan, err)
 		promptSpan.End()

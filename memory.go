@@ -358,7 +358,7 @@ func (ec *EngramClient) FetchContext(ctx context.Context, limit int, query strin
 	hasContent := false
 
 	if len(contextResp.RecentSessions) > 0 {
-		buf.WriteString("[Previous Session Context]\n")
+		buf.WriteString("<memory:sessions>\n")
 		for _, s := range contextResp.RecentSessions {
 			if s.Summary != "" {
 				buf.WriteString("- ")
@@ -367,11 +367,11 @@ func (ec *EngramClient) FetchContext(ctx context.Context, limit int, query strin
 				hasContent = true
 			}
 		}
-		buf.WriteString("\n")
+		buf.WriteString("</memory:sessions>\n")
 	}
 
 	if len(contextResp.RecentObservations) > 0 {
-		buf.WriteString("[Memory — Relevant Knowledge]\n")
+		buf.WriteString("<memory:context>\n")
 		for _, o := range contextResp.RecentObservations {
 			if o.Content != "" {
 				buf.WriteString("- [")
@@ -384,7 +384,7 @@ func (ec *EngramClient) FetchContext(ctx context.Context, limit int, query strin
 				hasContent = true
 			}
 		}
-		buf.WriteString("\n")
+		buf.WriteString("</memory:context>\n")
 	}
 
 	if !hasContent {

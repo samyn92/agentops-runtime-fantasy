@@ -87,9 +87,45 @@ type MCPEntry struct {
 
 // ToolHooksEntry holds runtime hook config.
 type ToolHooksEntry struct {
-	BlockedCommands []string `json:"blockedCommands,omitempty"`
-	AllowedPaths    []string `json:"allowedPaths,omitempty"`
-	AuditTools      []string `json:"auditTools,omitempty"`
+	BlockedCommands    []string            `json:"blockedCommands,omitempty"`
+	AllowedPaths       []string            `json:"allowedPaths,omitempty"`
+	AuditTools         []string            `json:"auditTools,omitempty"`
+	MemorySaveRules    []MemorySaveRule    `json:"memorySaveRules,omitempty"`
+	ContextInjectTools []ContextInjectRule `json:"contextInjectTools,omitempty"`
+}
+
+// MemorySaveRule describes a declarative rule for auto-saving tool results
+// as memory observations. When a tool matches, its output (optionally filtered
+// by regex) is saved to agentops-memory.
+type MemorySaveRule struct {
+	// Tool name to match (e.g. "bash", "web_search", "read").
+	Tool string `json:"tool"`
+	// Regex pattern to match against tool output. If empty, all output is captured.
+	// +optional
+	MatchOutput string `json:"matchOutput,omitempty"`
+	// Map of arg_name → regex pattern. All must match for the rule to fire.
+	// +optional
+	MatchArgs map[string]string `json:"matchArgs,omitempty"`
+	// Observation type to save (e.g. "bugfix", "discovery"). Default: "discovery".
+	// +optional
+	Type string `json:"type,omitempty"`
+	// Scope for the observation. Default: "project".
+	// +optional
+	Scope string `json:"scope,omitempty"`
+}
+
+// ContextInjectRule describes a pre-execution memory query for a tool.
+// Before the tool runs, relevant memories are fetched and recorded in the trace.
+type ContextInjectRule struct {
+	// Tool name to match.
+	Tool string `json:"tool"`
+	// How to derive the search query. "from_tool_args" (default) uses the tool's
+	// primary argument. Any other value is used as a static query string.
+	// +optional
+	Query string `json:"query,omitempty"`
+	// Max number of memory items to fetch. Default: 3.
+	// +optional
+	Limit int `json:"limit,omitempty"`
 }
 
 // ContextEntry describes a context file.
