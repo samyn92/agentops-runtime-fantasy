@@ -58,13 +58,16 @@ func (e *fepEmitter) emit(eventType string, fields map[string]any) {
 // Agent lifecycle events
 // --------------------------------------------------------------------
 
-func (e *fepEmitter) emitAgentStart(sessionId, prompt string, traceID string) {
+func (e *fepEmitter) emitAgentStart(sessionId, prompt string, traceID string, budget *ContextBudgetSnapshot) {
 	fields := map[string]any{
 		"session_id": sessionId,
 		"prompt":     prompt,
 	}
 	if traceID != "" {
 		fields["trace_id"] = traceID
+	}
+	if budget != nil {
+		fields["context_budget"] = budget
 	}
 	e.emit("agent_start", fields)
 }
@@ -97,14 +100,18 @@ func (e *fepEmitter) emitStepStart(stepNumber int, sessionId string) {
 	})
 }
 
-func (e *fepEmitter) emitStepFinish(stepNumber int, sessionId string, usage fantasy.Usage, finishReason fantasy.FinishReason, toolCallCount int) {
-	e.emit("step_finish", map[string]any{
+func (e *fepEmitter) emitStepFinish(stepNumber int, sessionId string, usage fantasy.Usage, finishReason fantasy.FinishReason, toolCallCount int, budget *ContextBudgetSnapshot) {
+	fields := map[string]any{
 		"step_number":     stepNumber,
 		"session_id":      sessionId,
 		"usage":           usageMap(usage),
 		"finish_reason":   string(finishReason),
 		"tool_call_count": toolCallCount,
-	})
+	}
+	if budget != nil {
+		fields["context_budget"] = budget
+	}
+	e.emit("step_finish", fields)
 }
 
 // --------------------------------------------------------------------

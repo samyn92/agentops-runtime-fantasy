@@ -1,16 +1,18 @@
 /*
 Agent Runtime — Fantasy (Go)
 
-Anthropic prompt caching integration.
-Sets cache_control breakpoints on system messages, tool definitions,
-and conversation messages to minimize input token costs.
+Anthropic prompt caching helpers.
+Sets cache_control breakpoints on tool definitions to minimize input token costs.
 
 Cache reads cost 90% less than uncached input on Anthropic.
+
+NOTE: System message and conversation boundary caching is now handled in
+context_injection.go via prepareStepWithContextInjection, which composes
+caching with memory/resource context injection.
 */
 package main
 
 import (
-	"context"
 	"strings"
 
 	"charm.land/fantasy"
@@ -24,49 +26,6 @@ func anthropicCacheOptions() fantasy.ProviderOptions {
 		anthropic.Name: &anthropic.ProviderCacheControlOptions{
 			CacheControl: anthropic.CacheControl{Type: "ephemeral"},
 		},
-	}
-}
-
-// prepareStepWithCaching returns a PrepareStepFunction that marks stable
-// context sections for Anthropic prompt caching.
-//
-// Strategy:
-//   - Mark the last system message for caching (system prompt + Engram protocol)
-//   - Mark the message just before the current user message (conversation history boundary)
-//
-// This gives us 2 cache breakpoints (Anthropic allows up to 4).
-// Tool caching is handled separately via SetProviderOptions on tool definitions.
-func prepareStepWithCaching() fantasy.PrepareStepFunction {
-	return func(ctx context.Context, opts fantasy.PrepareStepFunctionOptions) (context.Context, fantasy.PrepareStepResult, error) {
-		result := fantasy.PrepareStepResult{
-			Messages: opts.Messages,
-		}
-
-		if len(result.Messages) == 0 {
-			return ctx, result, nil
-		}
-
-		cacheOpts := anthropicCacheOptions()
-
-		// Find and cache the last system message (system prompt is always first)
-		lastSystemIdx := -1
-		for i, msg := range result.Messages {
-			if msg.Role == fantasy.MessageRoleSystem {
-				lastSystemIdx = i
-			}
-		}
-		if lastSystemIdx >= 0 {
-			result.Messages[lastSystemIdx].ProviderOptions = cacheOpts
-		}
-
-		// Cache the boundary between old history and current turn.
-		// The second-to-last message is typically the end of the previous
-		// turn's history — stable content that benefits from caching.
-		if len(result.Messages) >= 3 {
-			result.Messages[len(result.Messages)-2].ProviderOptions = cacheOpts
-		}
-
-		return ctx, result, nil
 	}
 }
 

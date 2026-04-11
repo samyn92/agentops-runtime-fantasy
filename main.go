@@ -77,9 +77,10 @@ type agentBundle struct {
 	agent     fantasy.Agent
 	providers map[string]fantasy.Provider
 	mcpConns  []mcpConnection
+	toolCount int // number of tools registered (for budget estimation)
 }
 
-func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, extraTools ...fantasy.AgentTool) (*agentBundle, error) {
+func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, injector *contextInjector, extraTools ...fantasy.AgentTool) (*agentBundle, error) {
 	// Resolve providers
 	providers := make(map[string]fantasy.Provider)
 	for _, p := range cfg.Providers {
@@ -156,10 +157,12 @@ func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, ex
 		fantasy.WithTools(tools...),
 	}
 
-	// Add Anthropic message caching via PrepareStep
-	if isAnthropicProvider(cfg) {
-		opts = append(opts, fantasy.WithPrepareStep(prepareStepWithCaching()))
-	}
+	// Add context injection + Anthropic caching via PrepareStep.
+	// This moves memory context and resource context from the user message into
+	// the system message as separate TextParts — correct semantics and cacheable.
+	opts = append(opts, fantasy.WithPrepareStep(
+		prepareStepWithContextInjection(injector, isAnthropicProvider(cfg)),
+	))
 
 	if cfg.SystemPrompt != "" {
 		opts = append(opts, fantasy.WithSystemPrompt(cfg.SystemPrompt))
@@ -194,6 +197,7 @@ func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, ex
 		agent:     fantasy.NewAgent(model, opts...),
 		providers: providers,
 		mcpConns:  allMCPConns,
+		toolCount: len(tools),
 	}, nil
 }
 
@@ -433,7 +437,7 @@ func runDaemon() error {
 		}
 
 		if err := engram.Init(); err != nil {
-			slog.Warn("engram init failed, running without persistent memory", "error", err)
+			slog.Warn("memory init failed, running without persistent memory", "error", err)
 			engram = nil
 		}
 
@@ -448,8 +452,11 @@ func runDaemon() error {
 
 	_ = contextLimit // used in prompt handlers via cfg
 
+	// Create context injector — holds per-turn memory/resource context for PrepareStep
+	ctxInjector := &contextInjector{}
+
 	// Build agent bundle (includes memory tools if engram is available)
-	bundle, err := buildAgentBundle(ctx, cfg, engram, buildMemoryTools(engram)...)
+	bundle, err := buildAgentBundle(ctx, cfg, engram, ctxInjector, buildMemoryTools(engram)...)
 	if err != nil {
 		return err
 	}
@@ -461,11 +468,21 @@ func runDaemon() error {
 		memory = NewWorkingMemory(windowSize)
 	}
 
+	// Create pre-flight context budget tracker
+	budgetFrac := DefaultBudgetFraction
+	if cfg.BudgetFraction != nil && *cfg.BudgetFraction > 0 && *cfg.BudgetFraction < 1 {
+		budgetFrac = *cfg.BudgetFraction
+	}
+	ctxBudget := NewContextBudget(cfg.PrimaryModel, budgetFrac)
+	ctxBudget.UpdateFixed(cfg.SystemPrompt, bundle.toolCount)
+
 	srv := &daemonServer{
 		bundle:      bundle,
 		cfg:         cfg,
 		memory:      memory,
 		engram:      engram,
+		injector:    ctxInjector,
+		budget:      ctxBudget,
 		activeModel: cfg.PrimaryModel,
 		agentName:   agentName,
 		convCtx:     &sessionContext{},
@@ -681,6 +698,8 @@ type daemonServer struct {
 	cfg          *Config
 	memory       *WorkingMemory
 	engram       *EngramClient
+	injector     *contextInjector // per-turn memory/resource context for PrepareStep
+	budget       *ContextBudget   // pre-flight context window budget tracker
 	activeModel  string
 	totalSteps   int
 	agentName    string // from AGENT_NAME env var
@@ -767,27 +786,34 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	// Get messages from working memory (bounded sliding window)
 	messages := s.memory.Messages()
 
-	// Fetch memory context (relevance-ranked by user prompt) and prepend
-	effectivePrompt := req.Prompt
+	// Set per-turn context on the injector — PrepareStep will inject it
+	// into the system message as separate TextParts.
+	var memoryCtx, resourceCtx string
 	if s.engram != nil {
 		contextLimit := 5
 		if s.cfg.Memory != nil && s.cfg.Memory.ContextLimit > 0 {
 			contextLimit = s.cfg.Memory.ContextLimit
 		}
-		if engramCtx := s.engram.FetchContext(ctx, contextLimit, req.Prompt); engramCtx != "" {
-			effectivePrompt = engramCtx + effectivePrompt
-		}
+		memoryCtx = s.engram.FetchContext(ctx, contextLimit, req.Prompt)
 	}
-
-	// Prepend resource context if provided
 	if len(req.Context) > 0 {
-		contextPrefix := formatResourceContext(req.Context)
-		effectivePrompt = contextPrefix + effectivePrompt
+		resourceCtx = formatResourceContext(req.Context)
 		slog.Info("resource context injected", "items", len(req.Context))
+	}
+	s.injector.Set(memoryCtx, resourceCtx)
+	defer s.injector.Clear()
+
+	// Pre-flight: update budget estimates and trim working memory to fit
+	s.budget.UpdatePerTurn(memoryCtx, resourceCtx, req.Prompt, messages)
+	convBudget := s.budget.ConversationBudget()
+	if trimmed, _ := s.memory.TrimToTokenBudget(convBudget); trimmed > 0 {
+		// Re-fetch messages after trim
+		messages = s.memory.Messages()
+		s.budget.UpdatePerTurn(memoryCtx, resourceCtx, req.Prompt, messages)
 	}
 
 	result, usedModel, err := generateWithFallback(ctx, s.cfg, s.bundle, fantasy.AgentCall{
-		Prompt:   effectivePrompt,
+		Prompt:   req.Prompt,
 		Messages: messages,
 	})
 	if err != nil {
@@ -913,23 +939,30 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 	// Get messages from working memory (bounded sliding window)
 	messages := s.memory.Messages()
 
-	// Fetch memory context (relevance-ranked by user prompt) and prepend
-	effectivePrompt := req.Prompt
+	// Set per-turn context on the injector — PrepareStep will inject it
+	// into the system message as separate TextParts.
+	var memoryCtx, resourceCtx string
 	if s.engram != nil {
 		contextLimit := 5
 		if s.cfg.Memory != nil && s.cfg.Memory.ContextLimit > 0 {
 			contextLimit = s.cfg.Memory.ContextLimit
 		}
-		if engramCtx := s.engram.FetchContext(ctx, contextLimit, req.Prompt); engramCtx != "" {
-			effectivePrompt = engramCtx + effectivePrompt
-		}
+		memoryCtx = s.engram.FetchContext(ctx, contextLimit, req.Prompt)
 	}
-
-	// Prepend resource context if provided
 	if len(req.Context) > 0 {
-		contextPrefix := formatResourceContext(req.Context)
-		effectivePrompt = contextPrefix + effectivePrompt
+		resourceCtx = formatResourceContext(req.Context)
 		slog.Info("resource context injected (stream)", "items", len(req.Context))
+	}
+	s.injector.Set(memoryCtx, resourceCtx)
+	defer s.injector.Clear()
+
+	// Pre-flight: update budget estimates and trim working memory to fit
+	s.budget.UpdatePerTurn(memoryCtx, resourceCtx, req.Prompt, messages)
+	convBudget := s.budget.ConversationBudget()
+	if trimmed, _ := s.memory.TrimToTokenBudget(convBudget); trimmed > 0 {
+		// Re-fetch messages after trim
+		messages = s.memory.Messages()
+		s.budget.UpdatePerTurn(memoryCtx, resourceCtx, req.Prompt, messages)
 	}
 
 	// Step counter (shared across callbacks)
@@ -941,12 +974,13 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 	var activeStepCtx context.Context
 	var activeStepSpan trace.Span
 
-	// Emit agent start with trace ID
+	// Emit agent start with trace ID and context budget snapshot
 	traceID := traceIDFromContext(ctx)
-	emit.emitAgentStart(s.agentName, req.Prompt, traceID)
+	budgetSnap := s.budget.Snapshot()
+	emit.emitAgentStart(s.agentName, req.Prompt, traceID, &budgetSnap)
 
 	result, usedModel, err := streamWithFallback(ctx, s.cfg, s.bundle, fantasy.AgentStreamCall{
-		Prompt:   effectivePrompt,
+		Prompt:   req.Prompt,
 		Messages: messages,
 
 		// ── Agent lifecycle ──
@@ -1016,7 +1050,10 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 				stepMu.Unlock()
 			}
 
-			emit.emitStepFinish(currentStep, s.agentName, sr.Usage, sr.FinishReason, toolCallCount)
+			// Update budget with actual token usage from API response
+			s.budget.UpdateActual(sr.Usage)
+			stepBudgetSnap := s.budget.Snapshot()
+			emit.emitStepFinish(currentStep, s.agentName, sr.Usage, sr.FinishReason, toolCallCount, &stepBudgetSnap)
 			return nil
 		},
 
@@ -1282,6 +1319,7 @@ func (s *daemonServer) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		"window_size":    s.memory.WindowSize(),
 		"turns":          s.memory.TurnCount(),
 		"memory_enabled": s.engram != nil,
+		"context_budget": s.budget.Snapshot(),
 	}
 	if traceID != "" {
 		resp["trace_id"] = traceID
@@ -1663,7 +1701,21 @@ func runTask() error {
 		}
 	}
 
-	bundle, err := buildAgentBundle(ctx, cfg, engram, buildMemoryTools(engram)...)
+	// Create context injector for task agent
+	taskInjector := &contextInjector{}
+
+	// Fetch memory context (relevance-ranked by task prompt) and set on injector
+	if engram != nil {
+		contextLimit := 5
+		if cfg.Memory != nil && cfg.Memory.ContextLimit > 0 {
+			contextLimit = cfg.Memory.ContextLimit
+		}
+		if memCtx := engram.FetchContext(ctx, contextLimit, prompt); memCtx != "" {
+			taskInjector.Set(memCtx, "")
+		}
+	}
+
+	bundle, err := buildAgentBundle(ctx, cfg, engram, taskInjector, buildMemoryTools(engram)...)
 	if err != nil {
 		recordError(promptSpan, err)
 		promptSpan.End()
@@ -1673,19 +1725,7 @@ func runTask() error {
 	}
 	defer shutdownMCPConnections(bundle.mcpConns)
 
-	// Fetch memory context (relevance-ranked by task prompt) — tasks were previously memory-blind
-	effectivePrompt := prompt
-	if engram != nil {
-		contextLimit := 5
-		if cfg.Memory != nil && cfg.Memory.ContextLimit > 0 {
-			contextLimit = cfg.Memory.ContextLimit
-		}
-		if memCtx := engram.FetchContext(ctx, contextLimit, prompt); memCtx != "" {
-			effectivePrompt = memCtx + effectivePrompt
-		}
-	}
-
-	agentResult, usedModel, err := generateWithFallback(ctx, cfg, bundle, fantasy.AgentCall{Prompt: effectivePrompt})
+	agentResult, usedModel, err := generateWithFallback(ctx, cfg, bundle, fantasy.AgentCall{Prompt: prompt})
 	if err != nil {
 		recordError(promptSpan, err)
 		promptSpan.End()

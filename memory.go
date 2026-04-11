@@ -212,6 +212,61 @@ func (wm *WorkingMemory) SetWindowSize(size int) {
 }
 
 // Clear drops all messages and resets the turn counter.
+
+// TrimToTokenBudget removes messages from the front of the working memory
+// until the estimated token count fits within the given budget.
+// Uses the same safe-boundary logic as Append (never orphans tool results).
+//
+// This is the token-aware complement to the message-count-based windowSize.
+// The two work together:
+//   - windowSize: fast O(1) upper bound on message count (quality guard)
+//   - TrimToTokenBudget: accurate token-based trim (resource guard)
+//
+// Returns the number of messages trimmed and the estimated token count after trimming.
+func (wm *WorkingMemory) TrimToTokenBudget(budgetTokens int64) (trimmed int, estimatedTokens int64) {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+
+	if len(wm.messages) == 0 {
+		return 0, 0
+	}
+
+	estimatedTokens = EstimateMessageTokens(wm.messages)
+	if estimatedTokens <= budgetTokens {
+		return 0, estimatedTokens
+	}
+
+	originalLen := len(wm.messages)
+
+	// Trim from front until we fit, always at safe boundaries.
+	for estimatedTokens > budgetTokens && len(wm.messages) > 1 {
+		// Find the next safe trim point (user or assistant message start)
+		trimAt := 1 // default: remove first message
+		for i := 1; i < len(wm.messages); i++ {
+			role := wm.messages[i].Role
+			if role == fantasy.MessageRoleUser || role == fantasy.MessageRoleAssistant {
+				trimAt = i
+				break
+			}
+		}
+
+		wm.messages = wm.messages[trimAt:]
+		estimatedTokens = EstimateMessageTokens(wm.messages)
+	}
+
+	trimmed = originalLen - len(wm.messages)
+	if trimmed > 0 {
+		slog.Info("working memory trimmed by token budget",
+			"trimmed_messages", trimmed,
+			"remaining_messages", len(wm.messages),
+			"estimated_tokens", estimatedTokens,
+			"budget_tokens", budgetTokens,
+		)
+	}
+
+	return trimmed, estimatedTokens
+}
+
 func (wm *WorkingMemory) Clear() {
 	wm.mu.Lock()
 	defer wm.mu.Unlock()
@@ -292,10 +347,10 @@ func (ec *EngramClient) Init() error {
 
 	_, err := ec.post("/sessions", body)
 	if err != nil {
-		return fmt.Errorf("engram init session: %w", err)
+		return fmt.Errorf("memory init session: %w", err)
 	}
 
-	slog.Info("engram session created", "session_id", ec.sessionID, "project", ec.project)
+	slog.Info("memory session created", "session_id", ec.sessionID, "project", ec.project)
 	return nil
 }
 
@@ -308,11 +363,11 @@ func (ec *EngramClient) FetchContext(ctx context.Context, limit int, query strin
 		return ""
 	}
 
-	ctx, span := tracer.Start(ctx, "engram.fetch_context")
+	ctx, span := tracer.Start(ctx, "memory.fetch_context")
 	defer span.End()
 	span.SetAttributes(
-		attrEngramOp.String("fetch_context"),
-		attrEngramProject.String(ec.project),
+		attrMemoryOp.String("fetch_context"),
+		attrMemoryProject.String(ec.project),
 	)
 
 	params := url.Values{
@@ -326,12 +381,12 @@ func (ec *EngramClient) FetchContext(ctx context.Context, limit int, query strin
 			query = query[:500]
 		}
 		params.Set("query", query)
-		span.SetAttributes(attribute.String("engram.context_query", query))
+		span.SetAttributes(attribute.String("memory.context_query", query))
 	}
 
 	resp, err := ec.get("/context", params)
 	if err != nil {
-		slog.Warn("engram fetch context failed", "error", err)
+		slog.Warn("memory fetch context failed", "error", err)
 		recordError(span, err)
 		return ""
 	}
@@ -350,7 +405,7 @@ func (ec *EngramClient) FetchContext(ctx context.Context, limit int, query strin
 	}
 
 	if err := json.Unmarshal(resp, &contextResp); err != nil {
-		slog.Warn("engram context parse failed", "error", err)
+		slog.Warn("memory context parse failed", "error", err)
 		return ""
 	}
 
@@ -400,11 +455,11 @@ func (ec *EngramClient) SaveObservation(ctx context.Context, obsType, title, con
 		return nil
 	}
 
-	ctx, span := tracer.Start(ctx, "engram.save_observation")
+	ctx, span := tracer.Start(ctx, "memory.save_observation")
 	defer span.End()
 	span.SetAttributes(
-		attrEngramOp.String("save_observation"),
-		attrEngramProject.String(ec.project),
+		attrMemoryOp.String("save_observation"),
+		attrMemoryProject.String(ec.project),
 	)
 
 	body := map[string]any{
@@ -421,10 +476,10 @@ func (ec *EngramClient) SaveObservation(ctx context.Context, obsType, title, con
 	_, err := ec.post("/observations", body)
 	if err != nil {
 		recordError(span, err)
-		return fmt.Errorf("engram save observation: %w", err)
+		return fmt.Errorf("memory save observation: %w", err)
 	}
 
-	slog.Info("engram observation saved", "type", obsType, "title", title)
+	slog.Info("memory observation saved", "type", obsType, "title", title)
 	return nil
 }
 
@@ -443,9 +498,9 @@ func (ec *EngramClient) EndSession(messages []EngramSessionMessage) {
 
 	_, err := ec.post("/sessions/"+ec.sessionID+"/end", body)
 	if err != nil {
-		slog.Warn("engram end session failed", "error", err)
+		slog.Warn("memory end session failed", "error", err)
 	} else {
-		slog.Info("engram session ended", "session_id", ec.sessionID)
+		slog.Info("memory session ended", "session_id", ec.sessionID)
 	}
 }
 
@@ -492,11 +547,11 @@ func (ec *EngramClient) Search(ctx context.Context, query string, limit int) ([]
 		return nil, nil
 	}
 
-	ctx, span := tracer.Start(ctx, "engram.search")
+	ctx, span := tracer.Start(ctx, "memory.search")
 	defer span.End()
 	span.SetAttributes(
-		attrEngramOp.String("search"),
-		attrEngramProject.String(ec.project),
+		attrMemoryOp.String("search"),
+		attrMemoryProject.String(ec.project),
 	)
 
 	params := url.Values{
@@ -510,12 +565,12 @@ func (ec *EngramClient) Search(ctx context.Context, query string, limit int) ([]
 	resp, err := ec.get("/search", params)
 	if err != nil {
 		recordError(span, err)
-		return nil, fmt.Errorf("engram search: %w", err)
+		return nil, fmt.Errorf("memory search: %w", err)
 	}
 
 	var results []EngramSearchResult
 	if err := json.Unmarshal(resp, &results); err != nil {
-		return nil, fmt.Errorf("engram search parse: %w", err)
+		return nil, fmt.Errorf("memory search parse: %w", err)
 	}
 	return results, nil
 }

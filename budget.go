@@ -2,13 +2,23 @@
 Agent Runtime — Fantasy (Go)
 
 Context window budget management.
-Prevents within-turn context blowup by monitoring input token growth
-and stopping the agent loop before hitting the model's context limit.
+
+Two layers of protection:
+ 1. Pre-flight budget allocation — estimates token usage per prompt layer
+    (system prompt, tools, memory context, conversation) and trims the working
+    memory to fit within a conversation budget BEFORE sending to the LLM.
+ 2. Reactive stop condition — halts the agent loop if actual InputTokens
+    (reported by the API response) exceeds the budget.
+
+Token estimation uses a chars/4 heuristic (~4 chars per token for English).
+This is intentionally approximate — exact tiktoken counting is not worth the
+dependency for pre-flight budgeting. The reactive guard catches any overshoot.
 */
 package main
 
 import (
 	"log/slog"
+	"sync"
 
 	"charm.land/fantasy"
 )
@@ -45,6 +55,11 @@ const DefaultContextWindow int64 = 200_000
 // input token budget. 0.75 means the agent stops when a step uses 75%
 // of the context window as input tokens, leaving 25% for output + safety.
 const DefaultBudgetFraction = 0.75
+
+// charsPerToken is the heuristic for token estimation (~4 chars per token
+// for English text). Intentionally conservative (underestimates tokens slightly)
+// to avoid hitting the actual limit.
+const charsPerToken = 4
 
 // contextWindowForModel returns the known context window size for a model string.
 // Falls back to DefaultContextWindow if the model is not recognized.
@@ -83,4 +98,166 @@ func InputTokenBudget(budgetTokens int64) fantasy.StopCondition {
 		}
 		return false
 	}
+}
+
+// ====================================================================
+// Pre-flight budget allocation
+// ====================================================================
+
+// ContextBudget tracks estimated token usage across prompt layers.
+// Updated per-turn and exposed to the FEP emitter for UI display.
+type ContextBudget struct {
+	mu sync.RWMutex
+
+	ContextWindow int64 // total context window for the model
+	BudgetTokens  int64 // usable budget (contextWindow * fraction)
+
+	// Estimated tokens per layer (pre-flight, chars/4 heuristic)
+	SystemPromptTokens  int64 // base system prompt + memory protocol
+	ToolTokens          int64 // tool definitions (measured once)
+	MemoryContextTokens int64 // per-turn memory context injection
+	ConversationTokens  int64 // working memory messages
+	PromptTokens        int64 // current user prompt + resource context
+
+	// Actual tokens from last API response (post-flight)
+	ActualInputTokens  int64
+	ActualOutputTokens int64
+	CacheReadTokens    int64
+	CacheWriteTokens   int64
+}
+
+// NewContextBudget creates a budget tracker for the given model.
+func NewContextBudget(model string, budgetFraction float64) *ContextBudget {
+	cw := contextWindowForModel(model)
+	return &ContextBudget{
+		ContextWindow: cw,
+		BudgetTokens:  int64(float64(cw) * budgetFraction),
+	}
+}
+
+// EstimateTokens returns an approximate token count for a string.
+// Uses the chars/4 heuristic — intentionally approximate.
+func EstimateTokens(s string) int64 {
+	if len(s) == 0 {
+		return 0
+	}
+	return int64((len(s) + charsPerToken - 1) / charsPerToken)
+}
+
+// EstimateMessageTokens returns an approximate token count for a slice of messages.
+func EstimateMessageTokens(msgs []fantasy.Message) int64 {
+	var total int64
+	for _, msg := range msgs {
+		// Per-message overhead (role token, structure)
+		total += 4
+		for _, part := range msg.Content {
+			if tp, ok := fantasy.AsMessagePart[fantasy.TextPart](part); ok {
+				total += EstimateTokens(tp.Text)
+			} else if tc, ok := fantasy.AsMessagePart[fantasy.ToolCallPart](part); ok {
+				total += EstimateTokens(tc.ToolName)
+				total += EstimateTokens(tc.Input)
+			} else if tr, ok := fantasy.AsMessagePart[fantasy.ToolResultPart](part); ok {
+				if text, ok := fantasy.AsToolResultOutputType[fantasy.ToolResultOutputContentText](tr.Output); ok {
+					total += EstimateTokens(text.Text)
+				}
+			}
+		}
+	}
+	return total
+}
+
+// ConversationBudget returns the token budget available for conversation history
+// after subtracting fixed costs (system prompt, tools) and per-turn costs
+// (memory context, user prompt). This is what working memory should trim to.
+func (cb *ContextBudget) ConversationBudget() int64 {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	budget := cb.BudgetTokens - cb.SystemPromptTokens - cb.ToolTokens - cb.MemoryContextTokens - cb.PromptTokens
+	if budget < 0 {
+		budget = 0
+	}
+	return budget
+}
+
+// UpdateFixed records the estimated token count for fixed-cost layers
+// (system prompt, tools). Called once at startup or when they change.
+func (cb *ContextBudget) UpdateFixed(systemPrompt string, toolCount int) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.SystemPromptTokens = EstimateTokens(systemPrompt)
+	// Tool definitions: rough estimate of ~150 tokens per tool (name + description + schema)
+	cb.ToolTokens = int64(toolCount) * 150
+}
+
+// UpdatePerTurn records the estimated token count for per-turn dynamic layers.
+// Called before each LLM call.
+func (cb *ContextBudget) UpdatePerTurn(memoryCtx, resourceCtx, prompt string, conversationMsgs []fantasy.Message) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.MemoryContextTokens = EstimateTokens(memoryCtx)
+	cb.PromptTokens = EstimateTokens(prompt) + EstimateTokens(resourceCtx)
+	cb.ConversationTokens = EstimateMessageTokens(conversationMsgs)
+}
+
+// UpdateActual records the actual token usage from the API response.
+// Called after each step or agent finish.
+func (cb *ContextBudget) UpdateActual(usage fantasy.Usage) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.ActualInputTokens = usage.InputTokens
+	cb.ActualOutputTokens = usage.OutputTokens
+	cb.CacheReadTokens = usage.CacheReadTokens
+	cb.CacheWriteTokens = usage.CacheCreationTokens
+}
+
+// Snapshot returns a copy of the current budget state for FEP emission.
+func (cb *ContextBudget) Snapshot() ContextBudgetSnapshot {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return ContextBudgetSnapshot{
+		ContextWindow:       cb.ContextWindow,
+		BudgetTokens:        cb.BudgetTokens,
+		SystemPromptTokens:  cb.SystemPromptTokens,
+		ToolTokens:          cb.ToolTokens,
+		MemoryContextTokens: cb.MemoryContextTokens,
+		ConversationTokens:  cb.ConversationTokens,
+		PromptTokens:        cb.PromptTokens,
+		ActualInputTokens:   cb.ActualInputTokens,
+		ActualOutputTokens:  cb.ActualOutputTokens,
+		CacheReadTokens:     cb.CacheReadTokens,
+		CacheWriteTokens:    cb.CacheWriteTokens,
+	}
+}
+
+// ContextBudgetSnapshot is an immutable copy of the budget state for serialization.
+type ContextBudgetSnapshot struct {
+	ContextWindow       int64 `json:"context_window"`
+	BudgetTokens        int64 `json:"budget_tokens"`
+	SystemPromptTokens  int64 `json:"system_prompt_tokens"`
+	ToolTokens          int64 `json:"tool_tokens"`
+	MemoryContextTokens int64 `json:"memory_context_tokens"`
+	ConversationTokens  int64 `json:"conversation_tokens"`
+	PromptTokens        int64 `json:"prompt_tokens"`
+	ActualInputTokens   int64 `json:"actual_input_tokens"`
+	ActualOutputTokens  int64 `json:"actual_output_tokens"`
+	CacheReadTokens     int64 `json:"cache_read_tokens"`
+	CacheWriteTokens    int64 `json:"cache_write_tokens"`
+}
+
+// UsedTokens returns the total estimated pre-flight token usage.
+func (s ContextBudgetSnapshot) UsedTokens() int64 {
+	return s.SystemPromptTokens + s.ToolTokens + s.MemoryContextTokens + s.ConversationTokens + s.PromptTokens
+}
+
+// UsagePercent returns the percentage of the context window used (0-100).
+func (s ContextBudgetSnapshot) UsagePercent() float64 {
+	if s.ContextWindow == 0 {
+		return 0
+	}
+	// Use actual tokens if available (more accurate), fall back to estimate
+	used := s.ActualInputTokens
+	if used == 0 {
+		used = s.UsedTokens()
+	}
+	return float64(used) / float64(s.ContextWindow) * 100
 }
