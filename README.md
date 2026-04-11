@@ -5,7 +5,7 @@
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8.svg)](https://go.dev/)
 [![Fantasy SDK](https://img.shields.io/badge/Fantasy_SDK-0.17-purple.svg)](https://github.com/charmbracelet/fantasy)
 
-Standalone Go binary that powers AI agent pods in [AgentOps](https://github.com/samyn92/agentops-core). Built on the [Charm Fantasy SDK](https://github.com/charmbracelet/fantasy) with a three-layer memory system backed by [Engram](https://github.com/samyn92/engram), Kubernetes-native agent orchestration, MCP tool integration, and a streaming protocol (FEP) for the [AgentOps console](https://github.com/samyn92/agentops-console).
+Standalone Go binary that powers AI agent pods in [AgentOps](https://github.com/samyn92/agentops-core). Built on the [Charm Fantasy SDK](https://github.com/charmbracelet/fantasy) with a three-layer memory system backed by [agentops-memory](https://github.com/samyn92/agentops-memory), Kubernetes-native agent orchestration, MCP tool integration, and a streaming protocol (FEP) for the [AgentOps console](https://github.com/samyn92/agentops-console).
 
 ---
 
@@ -53,7 +53,7 @@ Standalone Go binary that powers AI agent pods in [AgentOps](https://github.com/
 |  |                                                |  |
 |  |  Memory                                        |  |
 |  |    +-- Working memory (sliding window)         |  |
-|  |    +-- Engram client (short + long term)       |  |
+|  |    +-- Memory client (short + long term)       |  |
 |  |                                                |  |
 |  |  HTTP Server (:4096)                           |  |
 |  |    +-- FEP SSE streaming                       |  |
@@ -67,8 +67,8 @@ Standalone Go binary that powers AI agent pods in [AgentOps](https://github.com/
          |                          |
          | SSE/stdio                | HTTP REST
          v                          v
-   MCPServer CRs              Engram Service
-   (e.g. kubernetes)     (shared memory server)
+   MCPServer CRs              Memory Service
+   (e.g. kubernetes)     (agentops-memory)
 ```
 
 ---
@@ -78,7 +78,7 @@ Standalone Go binary that powers AI agent pods in [AgentOps](https://github.com/
 - **Charm Fantasy SDK** --- sole agent framework, with streaming callbacks, tool system, and multi-provider support
 - **Two execution modes** --- long-running daemon (HTTP server) or one-shot task (Job)
 - **14 tools** --- 8 built-in + 3 memory + 2 orchestration + 1 interactive question
-- **Three-layer memory** --- working memory (sliding window) + Engram short-term (auto-capture) + Engram long-term (explicit saves)
+- **Three-layer memory** --- working memory (sliding window) + agentops-memory short-term (session summaries) + agentops-memory long-term (explicit saves via FTS5 BM25)
 - **MCP integration** --- OCI-packaged tools via stdio and gateway MCP servers via SSE
 - **Multi-provider** --- Anthropic, OpenAI, Google/Gemini, OpenRouter, and any OpenAI-compatible endpoint
 - **Automatic fallback** --- cycles through fallback models on retryable errors (429, 5xx, rate limits)
@@ -96,7 +96,7 @@ Standalone Go binary that powers AI agent pods in [AgentOps](https://github.com/
 
 ### Daemon
 
-Long-running HTTP server for `Deployment`-backed agents. Serves the FEP streaming protocol on port `4096`, maintains conversation state in working memory, persists knowledge to Engram.
+Long-running HTTP server for `Deployment`-backed agents. Serves the FEP streaming protocol on port `4096`, maintains conversation state in working memory, persists knowledge to agentops-memory.
 
 ```sh
 agentops-runtime daemon
@@ -315,29 +315,28 @@ Three-layer memory system replacing unbounded session replay:
 | Layer | Storage | Survives Restart | Managed By |
 |-------|---------|:----------------:|------------|
 | **Working** | Go memory (sliding window) | No | Automatic |
-| **Short-term** | Engram SQLite (PVC) | Yes | Automatic (summaries, passive capture) |
-| **Long-term** | Engram SQLite (PVC) | Yes | User + agent (explicit saves) |
+| **Short-term** | agentops-memory SQLite (PVC) | Yes | Automatic (session summaries) |
+| **Long-term** | agentops-memory SQLite (PVC) | Yes | User + agent (explicit saves via `mem_save`) |
 
 ### Working Memory
 
 Fixed-size sliding window (default 20 messages). Trims at user-message boundaries to avoid orphaning tool-result messages that need their preceding assistant `tool_use` message. Dynamically adjustable at runtime via `PATCH /config/window-size`.
 
-### Engram Integration
+### Memory Service Integration
 
-Persistent memory via Engram's HTTP REST API:
+Persistent memory via agentops-memory's HTTP REST API:
 
-| Operation | Engram Endpoint | When |
-|-----------|----------------|------|
+| Operation | Endpoint | When |
+|-----------|---------|------|
 | Create session | `POST /sessions` | On runtime startup |
-| Fetch context | `GET /context?project=X&limit=N` | Before each prompt (injected as prefix) |
-| Passive capture | `POST /observations/passive` | After each successful prompt (async) |
+| Fetch context | `GET /context?project=X&limit=N&query=PROMPT` | Before each prompt (relevance-ranked injection) |
 | Save observation | `POST /observations` | Via `mem_save` tool |
 | Search memories | `GET /search?q=X&project=Y` | Via `mem_search` tool |
 | End session | `POST /sessions/{id}/end` | On graceful shutdown |
 
 ### Memory Tools
 
-Three tools added when Engram is configured:
+Three tools added when agentops-memory is configured:
 
 | Tool | Description |
 |------|-------------|
@@ -352,7 +351,7 @@ Via the Agent CRD `spec.memory`:
 ```yaml
 spec:
   memory:
-    serverRef: engram        # Service name or AgentTool CR
+    serverRef: agentops-memory  # Service name or AgentTool CR
     project: my-agent        # Memory scope (defaults to agent name)
     contextLimit: 5          # Max context items per turn
     windowSize: 20           # Working memory message limit
@@ -458,7 +457,7 @@ The runtime reads `/etc/operator/config.json`, generated by the AgentOps operato
   "maxOutputTokens": 8192,
   "maxSteps": 50,
   "memory": {
-    "serverURL": "http://engram.agents.svc:7437",
+    "serverURL": "http://agentops-memory.agents.svc:7437",
     "project": "my-agent",
     "contextLimit": 5,
     "windowSize": 20,
@@ -471,7 +470,7 @@ The runtime reads `/etc/operator/config.json`, generated by the AgentOps operato
 
 | Variable | Required | Description |
 |----------|:--------:|-------------|
-| `AGENT_NAME` | Yes | Agent identity, used for Engram project scoping |
+| `AGENT_NAME` | Yes | Agent identity, used for memory project scoping |
 | `AGENT_NAMESPACE` | No | Kubernetes namespace for AgentRun CRs (default: `default`) |
 | `AGENT_PROMPT` | Task only | The prompt for one-shot task mode |
 | `ANTHROPIC_API_KEY` | Per provider | Anthropic API key |
@@ -488,7 +487,7 @@ The runtime reads `/etc/operator/config.json`, generated by the AgentOps operato
 | Config path | `/etc/operator/config.json` | Operator-generated config |
 | HTTP port | `4096` | Server listen port |
 | Default window size | `20` | Working memory messages |
-| Default context limit | `5` | Engram context items per turn |
+| Default context limit | `5` | Memory context items per turn |
 | Permission timeout | `5 min` | Time to wait for user approval |
 | Question timeout | `10 min` | Time to wait for user answer |
 | Bash timeout | `120s` | Default command timeout |
@@ -505,7 +504,7 @@ agentops-runtime/
   config.go           # Config types parsed from /etc/operator/config.json
   fep.go              # FEP SSE emitter — 21 event type methods
   tools.go            # 8 built-in tools (bash, read, edit, write, grep, ls, glob, fetch)
-  memory.go           # Working memory (sliding window) + Engram client + 3 memory tools
+  memory.go           # Working memory (sliding window) + memory service client + 3 memory tools
   mcp.go              # MCP tool loading — OCI (stdio) + gateway (SSE) + tool adapter
   permission.go       # Permission gate — user approval before tool execution
   question.go         # Interactive question tool
@@ -573,7 +572,7 @@ Triggered by `v*` tags:
 | [agentops-console](https://github.com/samyn92/agentops-console) | Web console (Go BFF + SolidJS PWA) |
 | [agent-channels](https://github.com/samyn92/agent-channels) | Channel bridge images (Telegram, Slack, GitLab, etc.) |
 | [agent-tools](https://github.com/samyn92/agent-tools) | OCI tool/agent packaging CLI + tool packages |
-| [Engram](https://github.com/samyn92/engram) | Shared memory server (fork) |
+| [agentops-memory](https://github.com/samyn92/agentops-memory) | Purpose-built memory service (SQLite + FTS5 BM25) |
 | [Charm Fantasy SDK](https://github.com/charmbracelet/fantasy) | AI agent framework |
 
 ---

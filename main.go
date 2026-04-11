@@ -403,6 +403,7 @@ func runDaemon() error {
 	windowSize := 20
 	contextLimit := 5
 	var engram *EngramClient
+	var preBuiltMemory *WorkingMemory
 
 	if cfg.Memory != nil {
 		if cfg.Memory.WindowSize > 0 {
@@ -418,10 +419,31 @@ func runDaemon() error {
 		}
 
 		engram = NewEngramClient(cfg.Memory.ServerURL, project)
+
+		// Pre-flight: check for a working memory checkpoint with a session ID.
+		// If found, restore the session ID so the memory service reuses the
+		// pre-crash session instead of creating a new one.
+		wm := NewWorkingMemory(windowSize)
+		if restored := wm.RestoreCheckpoint(); restored > 0 {
+			slog.Info("recovered from checkpoint", "messages", restored)
+			if sid := wm.SessionID(); sid != "" {
+				engram.SetSessionID(sid)
+				slog.Info("restored memory session from checkpoint", "sessionID", sid)
+			}
+		}
+
 		if err := engram.Init(); err != nil {
 			slog.Warn("engram init failed, running without persistent memory", "error", err)
 			engram = nil
 		}
+
+		// Store the active session ID on working memory for future checkpoints
+		if engram != nil {
+			wm.SetSessionID(engram.SessionID())
+		}
+
+		// Stash wm for daemonServer construction below
+		preBuiltMemory = wm
 	}
 
 	_ = contextLimit // used in prompt handlers via cfg
@@ -433,19 +455,20 @@ func runDaemon() error {
 	}
 	defer shutdownMCPConnections(bundle.mcpConns)
 
+	// Use pre-built working memory if checkpoint restore happened, otherwise create fresh
+	memory := preBuiltMemory
+	if memory == nil {
+		memory = NewWorkingMemory(windowSize)
+	}
+
 	srv := &daemonServer{
 		bundle:      bundle,
 		cfg:         cfg,
-		memory:      NewWorkingMemory(windowSize),
+		memory:      memory,
 		engram:      engram,
 		activeModel: cfg.PrimaryModel,
 		agentName:   agentName,
 		convCtx:     &sessionContext{},
-	}
-
-	// Restore working memory from checkpoint if available (crash recovery)
-	if restored := srv.memory.RestoreCheckpoint(); restored > 0 {
-		slog.Info("recovered from checkpoint", "messages", restored)
 	}
 
 	// Initialize permission gate (emits permission_asked via the active SSE emitter)
@@ -499,6 +522,10 @@ func runDaemon() error {
 			tools = append(tools, newQuestionTool(srv.questionGate))
 		}
 
+		// Add memory tools (fix: these were missing in agent rebuild, causing
+		// agents with permission gates to silently lose mem_save/mem_search/mem_context)
+		tools = append(tools, buildMemoryTools(engram)...)
+
 		// Wrap ALL tools with hooks (tracing + truncation) BEFORE permission gates
 		tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars)
 
@@ -547,6 +574,9 @@ func runDaemon() error {
 		}
 
 		tools = append(tools, newQuestionTool(srv.questionGate))
+
+		// Add memory tools (fix: these were missing in question-tool-only rebuild)
+		tools = append(tools, buildMemoryTools(engram)...)
 
 		// Wrap ALL tools with hooks (tracing + truncation)
 		tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars)
@@ -608,7 +638,7 @@ func runDaemon() error {
 		// Save working memory checkpoint to PVC for crash recovery
 		srv.memory.SaveCheckpoint()
 
-		// End Engram session with raw messages — Engram handles summarization
+		// End memory session with raw messages for summarization
 		if srv.engram != nil {
 			srv.engram.EndSession(fantasyToEngramMessages(srv.memory.Messages()))
 		}
@@ -737,14 +767,14 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	// Get messages from working memory (bounded sliding window)
 	messages := s.memory.Messages()
 
-	// Fetch Engram context (short-term + long-term memories) and prepend
+	// Fetch memory context (relevance-ranked by user prompt) and prepend
 	effectivePrompt := req.Prompt
 	if s.engram != nil {
 		contextLimit := 5
 		if s.cfg.Memory != nil && s.cfg.Memory.ContextLimit > 0 {
 			contextLimit = s.cfg.Memory.ContextLimit
 		}
-		if engramCtx := s.engram.FetchContext(ctx, contextLimit); engramCtx != "" {
+		if engramCtx := s.engram.FetchContext(ctx, contextLimit, req.Prompt); engramCtx != "" {
 			effectivePrompt = engramCtx + effectivePrompt
 		}
 	}
@@ -777,11 +807,6 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 		s.memory.Append(step.Messages...)
 	}
 	s.memory.CompleteTurn()
-
-	// Passive capture to Engram (async, fire-and-forget)
-	if s.engram != nil {
-		s.engram.PassiveCapture(ctx, output)
-	}
 
 	traceID := traceIDFromContext(ctx)
 
@@ -888,14 +913,14 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 	// Get messages from working memory (bounded sliding window)
 	messages := s.memory.Messages()
 
-	// Fetch Engram context (short-term + long-term memories) and prepend
+	// Fetch memory context (relevance-ranked by user prompt) and prepend
 	effectivePrompt := req.Prompt
 	if s.engram != nil {
 		contextLimit := 5
 		if s.cfg.Memory != nil && s.cfg.Memory.ContextLimit > 0 {
 			contextLimit = s.cfg.Memory.ContextLimit
 		}
-		if engramCtx := s.engram.FetchContext(ctx, contextLimit); engramCtx != "" {
+		if engramCtx := s.engram.FetchContext(ctx, contextLimit, req.Prompt); engramCtx != "" {
 			effectivePrompt = engramCtx + effectivePrompt
 		}
 	}
@@ -1145,11 +1170,6 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 
 		// Emit agent finish with total usage
 		emit.emitAgentFinish(s.agentName, result.TotalUsage, finalSteps, usedModel)
-
-		// Passive capture to Engram (async, fire-and-forget)
-		if s.engram != nil {
-			s.engram.PassiveCapture(ctx, result.Response.Content.Text())
-		}
 	}
 
 	// Emit idle
@@ -1638,7 +1658,7 @@ func runTask() error {
 		}
 		engram = NewEngramClient(cfg.Memory.ServerURL, project)
 		if err := engram.Init(); err != nil {
-			slog.Warn("engram init failed for task, running without memory", "error", err)
+			slog.Warn("memory init failed for task, running without memory", "error", err)
 			engram = nil
 		}
 	}
@@ -1653,7 +1673,19 @@ func runTask() error {
 	}
 	defer shutdownMCPConnections(bundle.mcpConns)
 
-	agentResult, usedModel, err := generateWithFallback(ctx, cfg, bundle, fantasy.AgentCall{Prompt: prompt})
+	// Fetch memory context (relevance-ranked by task prompt) — tasks were previously memory-blind
+	effectivePrompt := prompt
+	if engram != nil {
+		contextLimit := 5
+		if cfg.Memory != nil && cfg.Memory.ContextLimit > 0 {
+			contextLimit = cfg.Memory.ContextLimit
+		}
+		if memCtx := engram.FetchContext(ctx, contextLimit, prompt); memCtx != "" {
+			effectivePrompt = memCtx + effectivePrompt
+		}
+	}
+
+	agentResult, usedModel, err := generateWithFallback(ctx, cfg, bundle, fantasy.AgentCall{Prompt: effectivePrompt})
 	if err != nil {
 		recordError(promptSpan, err)
 		promptSpan.End()
@@ -1691,8 +1723,7 @@ func runTask() error {
 		result.PullRequestURL = extractPullRequestURL(agentResult.Steps)
 	}
 
-	// End Engram session with raw messages (fixes session leak in task mode).
-	// Engram handles summarization server-side.
+	// End memory session with raw messages (fixes session leak in task mode).
 	if engram != nil {
 		taskMessages := []fantasy.Message{
 			fantasy.NewUserMessage(prompt),

@@ -31,6 +31,7 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // ====================================================================
@@ -44,6 +45,10 @@ type WorkingMemory struct {
 	messages []fantasy.Message
 	maxSize  int
 	turnNum  int // number of completed turns (user prompt + assistant response)
+
+	// sessionID is the memory service session ID. Set externally by the daemon
+	// server so SaveCheckpoint can persist it for crash recovery.
+	sessionID string
 
 	// toolMeta maps toolCallID → ClientMetadata JSON string.
 	// Populated from OnToolResult callbacks; persisted in checkpoints.
@@ -214,6 +219,20 @@ func (wm *WorkingMemory) Clear() {
 	wm.turnNum = 0
 }
 
+// SetSessionID stores the memory service session ID for checkpoint persistence.
+func (wm *WorkingMemory) SetSessionID(id string) {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+	wm.sessionID = id
+}
+
+// SessionID returns the memory service session ID (may be empty).
+func (wm *WorkingMemory) SessionID() string {
+	wm.mu.RLock()
+	defer wm.mu.RUnlock()
+	return wm.sessionID
+}
+
 // IsBusy and related state are tracked on daemonServer, not here.
 
 // ====================================================================
@@ -243,6 +262,22 @@ func NewEngramClient(serverURL, project string) *EngramClient {
 	}
 }
 
+// SetSessionID overrides the session ID. Used to restore a session from a
+// checkpoint so that pre-crash and post-crash memory share the same session.
+func (ec *EngramClient) SetSessionID(id string) {
+	if ec != nil && id != "" {
+		ec.sessionID = id
+	}
+}
+
+// SessionID returns the current session ID.
+func (ec *EngramClient) SessionID() string {
+	if ec == nil {
+		return ""
+	}
+	return ec.sessionID
+}
+
 // Init creates a session in Engram for this runtime lifecycle.
 // Called once at daemon startup.
 func (ec *EngramClient) Init() error {
@@ -264,10 +299,11 @@ func (ec *EngramClient) Init() error {
 	return nil
 }
 
-// FetchContext retrieves recent context from Engram (short-term + long-term memories).
+// FetchContext retrieves recent context from the memory service (short-term + long-term memories).
+// When a query is provided, the memory service uses FTS5 BM25 for relevance-ranked retrieval.
 // Returns a formatted string suitable for prepending to the system context.
 // Returns empty string on error or if no context is available.
-func (ec *EngramClient) FetchContext(ctx context.Context, limit int) string {
+func (ec *EngramClient) FetchContext(ctx context.Context, limit int, query string) string {
 	if ec == nil {
 		return ""
 	}
@@ -282,6 +318,15 @@ func (ec *EngramClient) FetchContext(ctx context.Context, limit int) string {
 	params := url.Values{
 		"project": {ec.project},
 		"limit":   {strconv.Itoa(limit)},
+	}
+	// Pass user prompt for relevance-ranked retrieval (FTS5 BM25).
+	if query != "" {
+		// Truncate to 500 chars — captures intent without sending full payloads.
+		if len(query) > 500 {
+			query = query[:500]
+		}
+		params.Set("query", query)
+		span.SetAttributes(attribute.String("engram.context_query", query))
 	}
 
 	resp, err := ec.get("/context", params)
@@ -383,38 +428,7 @@ func (ec *EngramClient) SaveObservation(ctx context.Context, obsType, title, con
 	return nil
 }
 
-// PassiveCapture sends assistant output for Engram's passive extraction.
-// Engram auto-detects noteworthy content (decisions, discoveries, etc.)
-// and stores it. Fire-and-forget — errors are logged but not propagated.
-func (ec *EngramClient) PassiveCapture(ctx context.Context, assistantOutput string) {
-	if ec == nil || assistantOutput == "" {
-		return
-	}
-
-	body := map[string]string{
-		"session_id": ec.sessionID,
-		"content":    assistantOutput,
-		"project":    ec.project,
-	}
-
-	go func() {
-		captureCtx, captureSpan := tracer.Start(ctx, "engram.passive_capture")
-		captureSpan.SetAttributes(
-			attrEngramOp.String("passive_capture"),
-			attrEngramProject.String(ec.project),
-		)
-		defer captureSpan.End()
-
-		_, err := ec.post("/observations/passive", body)
-		if err != nil {
-			slog.Debug("engram passive capture failed", "error", err)
-			recordError(captureSpan, err)
-		}
-		_ = captureCtx
-	}()
-}
-
-// EndSession ends the Engram session with an optional conversation transcript.
+// EndSession ends the memory session with an optional conversation transcript.
 // Engram is responsible for summarization — the runtime sends raw messages.
 // Called on daemon shutdown and task completion.
 func (ec *EngramClient) EndSession(messages []EngramSessionMessage) {
@@ -656,14 +670,14 @@ type memContextInput struct {
 
 func newMemContextTool(engram *EngramClient) fantasy.AgentTool {
 	return fantasy.NewAgentTool("mem_context",
-		"Retrieve recent memory context from Engram — recent observations and session summaries. Use this to refresh your knowledge about what happened in previous sessions.",
+		"Retrieve recent memory context — recent observations and session summaries. Use this to refresh your knowledge about what happened in previous sessions.",
 		func(ctx context.Context, input memContextInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			limit := input.Limit
 			if limit <= 0 {
 				limit = 5
 			}
 
-			memCtx := engram.FetchContext(ctx, limit)
+			memCtx := engram.FetchContext(ctx, limit, "")
 			if memCtx == "" {
 				return fantasy.NewTextResponse("No recent memory context available."), nil
 			}

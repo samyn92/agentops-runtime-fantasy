@@ -20,9 +20,10 @@ const checkpointPath = "/data/sessions/checkpoint.json"
 
 // checkpointData wraps the serialized working memory with metadata.
 type checkpointData struct {
-	TurnNum  int                   `json:"turnNum"`
-	Messages []serializableMessage `json:"messages"`
-	ToolMeta map[string]string     `json:"toolMeta,omitempty"` // toolCallID → ClientMetadata JSON
+	TurnNum   int                   `json:"turnNum"`
+	SessionID string                `json:"sessionID,omitempty"` // memory service session ID for crash recovery
+	Messages  []serializableMessage `json:"messages"`
+	ToolMeta  map[string]string     `json:"toolMeta,omitempty"` // toolCallID → ClientMetadata JSON
 }
 
 // SaveCheckpoint serializes the working memory to disk.
@@ -38,9 +39,10 @@ func (wm *WorkingMemory) SaveCheckpoint() {
 	}
 
 	data := checkpointData{
-		TurnNum:  wm.turnNum,
-		Messages: serializeMessages(wm.messages, wm.toolMeta),
-		ToolMeta: wm.toolMeta,
+		TurnNum:   wm.turnNum,
+		SessionID: wm.sessionID,
+		Messages:  serializeMessages(wm.messages, wm.toolMeta),
+		ToolMeta:  wm.toolMeta,
 	}
 
 	raw, err := json.Marshal(data)
@@ -96,6 +98,7 @@ func (wm *WorkingMemory) RestoreCheckpoint() int {
 	defer wm.mu.Unlock()
 	wm.messages = messages
 	wm.turnNum = data.TurnNum
+	wm.sessionID = data.SessionID
 	if data.ToolMeta != nil {
 		wm.toolMeta = data.ToolMeta
 	}
@@ -103,6 +106,7 @@ func (wm *WorkingMemory) RestoreCheckpoint() int {
 	slog.Info("working memory restored from checkpoint",
 		"messages", len(messages),
 		"turns", data.TurnNum,
+		"sessionID", data.SessionID,
 	)
 
 	// Remove checkpoint after successful restore — it's been consumed
