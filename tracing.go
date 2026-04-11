@@ -34,18 +34,30 @@ import (
 // Package-level tracer used by all instrumentation points.
 var tracer trace.Tracer
 
+// tracingFuncs holds the ForceFlush and Shutdown functions returned by initTracing.
+// ForceFlush must be called before Shutdown in short-lived task pods to ensure
+// all ended spans (especially tool.execute children) are exported to Tempo
+// before the process exits.
+type tracingFuncs struct {
+	ForceFlush func(context.Context) error
+	Shutdown   func(context.Context) error
+}
+
 // initTracing sets up the OTel TracerProvider with an OTLP gRPC exporter.
-// Returns a shutdown function that must be called before process exit.
+// Returns tracingFuncs with ForceFlush and Shutdown that must be called before
+// process exit. ForceFlush ensures all completed spans are exported; Shutdown
+// tears down the provider.
 //
-// When OTEL_EXPORTER_OTLP_ENDPOINT is empty, returns a no-op shutdown
+// When OTEL_EXPORTER_OTLP_ENDPOINT is empty, returns no-op functions
 // and uses the global no-op tracer — zero overhead in non-instrumented deployments.
-func initTracing(ctx context.Context, agentName, agentNamespace, agentMode string) (shutdown func(context.Context) error, err error) {
+func initTracing(ctx context.Context, agentName, agentNamespace, agentMode string) (*tracingFuncs, error) {
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 	if endpoint == "" {
 		// No endpoint configured — use no-op tracer
 		tracer = otel.Tracer("agentops-runtime")
 		slog.Info("tracing disabled (OTEL_EXPORTER_OTLP_ENDPOINT not set)")
-		return func(context.Context) error { return nil }, nil
+		noop := func(context.Context) error { return nil }
+		return &tracingFuncs{ForceFlush: noop, Shutdown: noop}, nil
 	}
 
 	// Build resource attributes
@@ -100,7 +112,7 @@ func initTracing(ctx context.Context, agentName, agentNamespace, agentMode strin
 		"mode", agentMode,
 	)
 
-	return tp.Shutdown, nil
+	return &tracingFuncs{ForceFlush: tp.ForceFlush, Shutdown: tp.Shutdown}, nil
 }
 
 // ────────────────────────────────────────────────────────────────────

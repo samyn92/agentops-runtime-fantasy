@@ -394,7 +394,7 @@ func runDaemon() error {
 
 	// Initialize OpenTelemetry tracing
 	agentNamespace := os.Getenv("AGENT_NAMESPACE")
-	shutdownTracing, err := initTracing(ctx, agentName, agentNamespace, "daemon")
+	tracingFns, err := initTracing(ctx, agentName, agentNamespace, "daemon")
 	if err != nil {
 		slog.Warn("tracing init failed, continuing without tracing", "error", err)
 	}
@@ -614,8 +614,8 @@ func runDaemon() error {
 		}
 
 		// Flush pending traces before exit
-		if shutdownTracing != nil {
-			if err := shutdownTracing(context.Background()); err != nil {
+		if tracingFns != nil {
+			if err := tracingFns.Shutdown(context.Background()); err != nil {
 				slog.Warn("tracing shutdown error", "error", err)
 			}
 		}
@@ -1562,18 +1562,24 @@ func runTask() error {
 		agentName = "default"
 	}
 	agentNamespace := os.Getenv("AGENT_NAMESPACE")
-	shutdownTracing, err := initTracing(ctx, agentName, agentNamespace, "task")
+	tracingFns, err := initTracing(ctx, agentName, agentNamespace, "task")
 	if err != nil {
 		slog.Warn("tracing init failed, continuing without tracing", "error", err)
 	}
 	defer func() {
-		if shutdownTracing != nil {
+		if tracingFns != nil {
 			// Give the batch exporter up to 30s to flush all spans to Tempo.
-			// Without a deadline the gRPC export may hang or the process may
-			// exit before all tool/step spans are delivered.
+			// ForceFlush first to ensure all ended spans (including tool.execute
+			// children of gen_ai.generate) are exported before shutdown.
+			// Without this, short-lived task pods often exit before the batch
+			// exporter delivers tool spans, causing the console to fall back
+			// to lower-fidelity virtual rows from tool.call events.
 			flushCtx, flushCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer flushCancel()
-			if err := shutdownTracing(flushCtx); err != nil {
+			if err := tracingFns.ForceFlush(flushCtx); err != nil {
+				slog.Warn("tracing force flush error", "error", err)
+			}
+			if err := tracingFns.Shutdown(flushCtx); err != nil {
 				slog.Warn("tracing shutdown error", "error", err)
 			}
 		}
