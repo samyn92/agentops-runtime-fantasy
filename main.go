@@ -404,15 +404,11 @@ func runDaemon() error {
 	}
 
 	// Initialize memory system
-	windowSize := 20
 	contextLimit := 5
 	var engram *EngramClient
 	var preBuiltMemory *WorkingMemory
 
 	if cfg.Memory != nil {
-		if cfg.Memory.WindowSize > 0 {
-			windowSize = cfg.Memory.WindowSize
-		}
 		if cfg.Memory.ContextLimit > 0 {
 			contextLimit = cfg.Memory.ContextLimit
 		}
@@ -427,7 +423,7 @@ func runDaemon() error {
 		// Pre-flight: check for a working memory checkpoint with a session ID.
 		// If found, restore the session ID so the memory service reuses the
 		// pre-crash session instead of creating a new one.
-		wm := NewWorkingMemory(windowSize)
+		wm := NewWorkingMemory()
 		if restored := wm.RestoreCheckpoint(); restored > 0 {
 			slog.Info("recovered from checkpoint", "messages", restored)
 			if sid := wm.SessionID(); sid != "" {
@@ -465,7 +461,7 @@ func runDaemon() error {
 	// Use pre-built working memory if checkpoint restore happened, otherwise create fresh
 	memory := preBuiltMemory
 	if memory == nil {
-		memory = NewWorkingMemory(windowSize)
+		memory = NewWorkingMemory()
 	}
 
 	// Create pre-flight context budget tracker
@@ -639,8 +635,6 @@ func runDaemon() error {
 	mux.HandleFunc("GET /status", srv.handleStatus)
 
 	// Live configuration
-	mux.HandleFunc("PATCH /config/window-size", srv.handleSetWindowSize)
-	mux.HandleFunc("DELETE /working-memory", srv.handleClearWorkingMemory)
 	mux.HandleFunc("GET /working-memory", srv.handleGetWorkingMemory)
 
 	// AI-assisted memory extraction
@@ -783,7 +777,7 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	// Record the user prompt as a content event for trace visibility
 	recordPromptEvent(promptSpan, req.Prompt)
 
-	// Get messages from working memory (bounded sliding window)
+	// Get messages from working memory
 	messages := s.memory.Messages()
 
 	// Set per-turn context on the injector — PrepareStep will inject it
@@ -827,7 +821,7 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	// Record the assistant response as a content event
 	recordCompletionEvent(promptSpan, output)
 
-	// Append to working memory (sliding window — drops oldest when full)
+	// Append to working memory
 	s.memory.Append(fantasy.NewUserMessage(req.Prompt))
 	for _, step := range result.Steps {
 		s.memory.Append(step.Messages...)
@@ -936,7 +930,7 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 	// Inject agent name into Go context so tools (permission gate, question tool) can read it.
 	ctx = context.WithValue(ctx, agentContextKey{}, s.agentName)
 
-	// Get messages from working memory (bounded sliding window)
+	// Get messages from working memory
 	messages := s.memory.Messages()
 
 	// Set per-turn context on the injector — PrepareStep will inject it
@@ -1177,7 +1171,7 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 		recordError(promptSpan, err)
 		emit.emitAgentError(s.agentName, err, isRetryableError(err))
 	} else {
-		// Append to working memory (sliding window)
+		// Append to working memory
 		s.memory.Append(fantasy.NewUserMessage(req.Prompt))
 		for _, step := range result.Steps {
 			s.memory.Append(step.Messages...)
@@ -1316,7 +1310,6 @@ func (s *daemonServer) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		"total_steps":    steps,
 		"busy":           busy,
 		"messages":       s.memory.MessageCount(),
-		"window_size":    s.memory.WindowSize(),
 		"turns":          s.memory.TurnCount(),
 		"memory_enabled": s.engram != nil,
 		"context_budget": s.budget.Snapshot(),
@@ -1327,39 +1320,6 @@ func (s *daemonServer) handleStatus(w http.ResponseWriter, _ *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
-}
-
-func (s *daemonServer) handleSetWindowSize(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Size int `json:"size"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Size < 2 {
-		http.Error(w, `{"error":"size is required and must be >= 2"}`, http.StatusBadRequest)
-		return
-	}
-
-	s.memory.SetWindowSize(req.Size)
-	slog.Info("window size updated", "new_size", req.Size, "messages", s.memory.MessageCount())
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"ok":          true,
-		"window_size": s.memory.WindowSize(),
-		"messages":    s.memory.MessageCount(),
-	})
-}
-
-func (s *daemonServer) handleClearWorkingMemory(w http.ResponseWriter, r *http.Request) {
-	s.memory.Clear()
-	RemoveCheckpoint() // also clear the on-disk checkpoint
-	slog.Info("working memory cleared")
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"ok":          true,
-		"window_size": s.memory.WindowSize(),
-		"messages":    s.memory.MessageCount(),
-	})
 }
 
 // ── Get working memory (serialized for the console frontend) ──
@@ -1907,6 +1867,14 @@ func newRunAgentTool(k8s *K8sClient, resources []ResourceEntry) fantasy.AgentToo
 					"Agent %q not found. Available agents:%s", input.Agent, agentList)), nil
 			}
 
+			// Check delegation constraints: is this agent allowed to delegate to the target?
+			targetScope, targetCallers, discErr := k8s.GetAgentDiscovery(ctx, input.Agent)
+			if discErr == nil && !isAgentVisible(targetScope, targetCallers, agentName) {
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Agent %q is not available for delegation (scope: %s). You are not in its allowedCallers list.",
+					input.Agent, targetScope)), nil
+			}
+
 			// Warn if targeting a daemon (will use HTTP prompt, not spawn a Job)
 			if agentInfo.Mode == "daemon" && agentInfo.Phase != "Running" {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf(
@@ -2047,16 +2015,20 @@ type listTaskAgentsInput struct {
 func newListTaskAgentsTool(k8s *K8sClient) fantasy.AgentTool {
 	return fantasy.NewAgentTool("list_task_agents",
 		"List available agents with their capabilities and bound resources. "+
-			"Returns each agent's name, mode, phase, model, system prompt summary, and bound resources "+
+			"Returns each agent's name, mode, phase, model, description (or system prompt summary), tags, and bound resources "+
 			"(git repos with owner/project info and default branches). "+
+			"Agents with scope=hidden are excluded. Agents with scope=explicit are only shown if you are in their allowedCallers. "+
 			"Use this to decide which agent to delegate to and which git resources are available for run_agent.",
 		func(ctx context.Context, input listTaskAgentsInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
-			agents, err := k8s.ListAgentDetails(ctx)
+			selfName := os.Getenv("AGENT_NAME")
+			if selfName == "" {
+				selfName = "unknown"
+			}
+
+			agents, err := k8s.ListAgentDetails(ctx, selfName)
 			if err != nil {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("Failed to list agents: %s", err)), nil
 			}
-
-			selfName := os.Getenv("AGENT_NAME")
 
 			var text strings.Builder
 			text.WriteString("Available agents:\n")
@@ -2080,8 +2052,16 @@ func newListTaskAgentsTool(k8s *K8sClient) fantasy.AgentTool {
 				}
 				text.WriteString("\n")
 
-				if a.SystemPrompt != "" {
+				// Prefer discovery.description over truncated system prompt
+				if a.Description != "" {
+					text.WriteString(fmt.Sprintf("  Description: %s\n", a.Description))
+				} else if a.SystemPrompt != "" {
 					text.WriteString(fmt.Sprintf("  Purpose: %s\n", a.SystemPrompt))
+				}
+
+				// Show tags if present
+				if len(a.Tags) > 0 {
+					text.WriteString(fmt.Sprintf("  Tags: %s\n", strings.Join(a.Tags, ", ")))
 				}
 
 				if len(a.ResourceBindings) > 0 {

@@ -1,18 +1,19 @@
 /*
 Agent Runtime — Fantasy (Go)
 
-Memory system: replaces session.go with a three-layer architecture.
+Memory system: three-layer architecture.
 
- 1. Working Memory — fixed-size sliding window of fantasy.Message in Go memory.
+ 1. Working Memory — unbounded list of fantasy.Message in Go memory.
+    Trimmed by token budget (TrimToTokenBudget) before each turn.
     Ephemeral: lost on pod restart. This is what gets passed to the Fantasy SDK.
 
- 2. Short-term Memory — session summaries stored in Engram (auto-managed).
+ 2. Short-term Memory — session summaries stored in agentops-memory (auto-managed).
     Fetched via HTTP before each turn and prepended as context.
 
- 3. Long-term Memory — explicit observations in Engram (user/agent-managed).
-    Same Engram instance, searched on demand.
+ 3. Long-term Memory — explicit observations in agentops-memory (user/agent-managed).
+    Same memory service instance, searched on demand.
 
-Engram is accessed via its REST API (not MCP). The runtime is a thin HTTP client.
+agentops-memory is accessed via its REST API (not MCP). The runtime is a thin HTTP client.
 */
 package main
 
@@ -35,15 +36,14 @@ import (
 )
 
 // ====================================================================
-// Working Memory — bounded sliding window of messages
+// Working Memory — token-budget-managed message list
 // ====================================================================
 
-// WorkingMemory holds the last N messages in a sliding window.
+// WorkingMemory holds conversation messages, trimmed by token budget before each turn.
 // Thread-safe. Ephemeral — lost on pod restart by design.
 type WorkingMemory struct {
 	mu       sync.RWMutex
 	messages []fantasy.Message
-	maxSize  int
 	turnNum  int // number of completed turns (user prompt + assistant response)
 
 	// sessionID is the memory service session ID. Set externally by the daemon
@@ -57,14 +57,10 @@ type WorkingMemory struct {
 	toolMeta map[string]string
 }
 
-// NewWorkingMemory creates a working memory with the given window size.
-func NewWorkingMemory(windowSize int) *WorkingMemory {
-	if windowSize < 2 {
-		windowSize = 20
-	}
+// NewWorkingMemory creates an empty working memory.
+func NewWorkingMemory() *WorkingMemory {
 	return &WorkingMemory{
-		messages: make([]fantasy.Message, 0, windowSize),
-		maxSize:  windowSize,
+		messages: make([]fantasy.Message, 0, 32),
 		toolMeta: make(map[string]string),
 	}
 }
@@ -100,52 +96,12 @@ func (wm *WorkingMemory) ToolMeta() map[string]string {
 	return out
 }
 
-// Append adds messages to the window, dropping the oldest if the window is full.
-// Messages are trimmed from the front to stay within maxSize. We trim at clean
-// boundaries to avoid orphaning tool messages (assistant tool_use must stay
-// paired with the following tool result).
-//
-// A clean boundary is a user message that is NOT a tool-result message
-// (role == "user", not role == "tool"). We scan forward from the excess point
-// to find such a boundary.
+// Append adds messages to the working memory.
+// No size limit — trimming is handled by TrimToTokenBudget before each turn.
 func (wm *WorkingMemory) Append(msgs ...fantasy.Message) {
 	wm.mu.Lock()
 	defer wm.mu.Unlock()
-
 	wm.messages = append(wm.messages, msgs...)
-
-	// Trim from front if over capacity
-	if len(wm.messages) > wm.maxSize {
-		excess := len(wm.messages) - wm.maxSize
-
-		// Find a safe trim point: must be a user message (not tool/assistant).
-		// Scan forward from excess to find one. This ensures we never leave an
-		// orphaned tool-result at the start (which requires its preceding
-		// assistant tool_use message).
-		trimAt := excess
-		for i := excess; i < len(wm.messages); i++ {
-			if wm.messages[i].Role == fantasy.MessageRoleUser {
-				trimAt = i
-				break
-			}
-			// If we hit another assistant message, that's also safe — it starts
-			// a new exchange. But prefer user messages.
-			if wm.messages[i].Role == fantasy.MessageRoleAssistant && i > excess {
-				trimAt = i
-				break
-			}
-		}
-
-		// Safety: if trimAt would leave us with 0 messages, just keep the last maxSize
-		if trimAt >= len(wm.messages) {
-			trimAt = len(wm.messages) - wm.maxSize
-			if trimAt < 0 {
-				trimAt = 0
-			}
-		}
-
-		wm.messages = wm.messages[trimAt:]
-	}
 }
 
 // CompleteTurn increments the turn counter. Called after each prompt/response cycle.
@@ -169,58 +125,15 @@ func (wm *WorkingMemory) MessageCount() int {
 	return len(wm.messages)
 }
 
-// WindowSize returns the maximum sliding window capacity.
-func (wm *WorkingMemory) WindowSize() int {
-	wm.mu.RLock()
-	defer wm.mu.RUnlock()
-	return wm.maxSize
-}
-
-// SetWindowSize changes the sliding window capacity at runtime.
-// If the new size is smaller than the current message count, excess messages
-// are trimmed from the front (oldest first) at the next Append call.
-// Minimum size is 2.
-func (wm *WorkingMemory) SetWindowSize(size int) {
-	if size < 2 {
-		size = 2
-	}
-	wm.mu.Lock()
-	defer wm.mu.Unlock()
-	wm.maxSize = size
-	// Eagerly trim if currently over the new limit
-	if len(wm.messages) > wm.maxSize {
-		excess := len(wm.messages) - wm.maxSize
-		trimAt := excess
-		for i := excess; i < len(wm.messages); i++ {
-			if wm.messages[i].Role == fantasy.MessageRoleUser {
-				trimAt = i
-				break
-			}
-			if wm.messages[i].Role == fantasy.MessageRoleAssistant && i > excess {
-				trimAt = i
-				break
-			}
-		}
-		if trimAt >= len(wm.messages) {
-			trimAt = len(wm.messages) - wm.maxSize
-			if trimAt < 0 {
-				trimAt = 0
-			}
-		}
-		wm.messages = wm.messages[trimAt:]
-	}
-}
-
 // Clear drops all messages and resets the turn counter.
 
 // TrimToTokenBudget removes messages from the front of the working memory
 // until the estimated token count fits within the given budget.
-// Uses the same safe-boundary logic as Append (never orphans tool results).
+// Uses safe-boundary logic (never orphans tool results).
 //
-// This is the token-aware complement to the message-count-based windowSize.
-// The two work together:
-//   - windowSize: fast O(1) upper bound on message count (quality guard)
-//   - TrimToTokenBudget: accurate token-based trim (resource guard)
+// This is the primary mechanism for keeping conversation history within
+// the model's context window. Called before each turn with the available
+// conversation budget from the pre-flight ContextBudget.
 //
 // Returns the number of messages trimmed and the estimated token count after trimming.
 func (wm *WorkingMemory) TrimToTokenBudget(budgetTokens int64) (trimmed int, estimatedTokens int64) {

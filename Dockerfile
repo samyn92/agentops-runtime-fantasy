@@ -8,7 +8,7 @@ RUN go mod download
 COPY *.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o agent-runtime .
 
-FROM alpine:3.21
+FROM alpine:3.20
 # Install minimal tools needed by built-in tools
 RUN apk add --no-cache bash curl ripgrep git
 COPY --from=builder /app/agent-runtime /app/agent-runtime
