@@ -165,10 +165,10 @@ var (
 	attrToolDuration  = attribute.Key("tool.duration_ms")
 )
 
-// Engram attributes
+// Memory attributes
 var (
-	attrEngramOp      = attribute.Key("engram.operation")
-	attrEngramProject = attribute.Key("engram.project")
+	attrMemoryOp      = attribute.Key("memory.operation")
+	attrMemoryProject = attribute.Key("memory.project")
 )
 
 // ────────────────────────────────────────────────────────────────────
