@@ -17,6 +17,7 @@ import (
 )
 
 const checkpointPath = "/data/sessions/checkpoint.json"
+const delegationCheckpointPath = "/data/sessions/delegation_checkpoint.json"
 
 // checkpointData wraps the serialized working memory with metadata.
 type checkpointData struct {
@@ -231,4 +232,58 @@ func deserializeMessages(sms []serializableMessage) []fantasy.Message {
 		messages = append(messages, msg)
 	}
 	return messages
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Delegation checkpoint: persist active delegation groups for crash recovery
+// ════════════════════════════════════════════════════════════════════
+
+// SaveDelegationCheckpoint writes active delegation groups to disk.
+// Called on graceful shutdown alongside the working memory checkpoint.
+func SaveDelegationCheckpoint(groups []DelegationGroup) {
+	if len(groups) == 0 {
+		os.Remove(delegationCheckpointPath)
+		return
+	}
+
+	raw, err := json.Marshal(groups)
+	if err != nil {
+		slog.Warn("delegation checkpoint marshal failed", "error", err)
+		return
+	}
+
+	os.MkdirAll(filepath.Dir(delegationCheckpointPath), 0755)
+
+	tmpPath := delegationCheckpointPath + ".tmp"
+	if err := os.WriteFile(tmpPath, raw, 0644); err != nil {
+		slog.Warn("delegation checkpoint write failed", "error", err)
+		return
+	}
+	if err := os.Rename(tmpPath, delegationCheckpointPath); err != nil {
+		slog.Warn("delegation checkpoint rename failed", "error", err)
+		os.Remove(tmpPath)
+		return
+	}
+
+	slog.Info("delegation checkpoint saved", "groups", len(groups))
+}
+
+// RestoreDelegationCheckpoint loads persisted delegation groups from disk.
+// Returns nil if no checkpoint exists. Removes the file after successful read.
+func RestoreDelegationCheckpoint() []DelegationGroup {
+	raw, err := os.ReadFile(delegationCheckpointPath)
+	if err != nil {
+		return nil
+	}
+
+	var groups []DelegationGroup
+	if err := json.Unmarshal(raw, &groups); err != nil {
+		slog.Warn("delegation checkpoint parse failed, discarding", "error", err)
+		os.Remove(delegationCheckpointPath)
+		return nil
+	}
+
+	os.Remove(delegationCheckpointPath)
+	slog.Info("delegation checkpoint restored", "groups", len(groups))
+	return groups
 }

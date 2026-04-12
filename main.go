@@ -82,6 +82,8 @@ type agentBundle struct {
 	// This ensures the rebuild never diverges from the primary path.
 	baseTools []fantasy.AgentTool
 	baseOpts  []fantasy.AgentOption
+	// delegationWatcher tracks parallel fan-out delegation groups (nil if K8s unavailable)
+	delegationWatcher *DelegationWatcher
 }
 
 func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, injector *contextInjector, extraTools ...fantasy.AgentTool) (*agentBundle, error) {
@@ -134,13 +136,15 @@ func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, in
 		slog.Info("built-in git tools enabled", "count", len(gitTools()))
 	}
 
-	// Add orchestration tools (run_agent, get_agent_run, list_task_agents)
+	// Add orchestration tools (run_agent, run_agents, get_agent_run, list_task_agents)
 	k8sClient, err := NewK8sClient()
+	var delegationWatcher *DelegationWatcher
 	if err != nil {
 		slog.Warn("K8s client unavailable, orchestration tools disabled", "error", err)
-		tools = append(tools, newRunAgentToolStub(), newGetAgentRunToolStub(), newListTaskAgentsToolStub())
+		tools = append(tools, newRunAgentToolStub(), newRunAgentsToolStub(), newGetAgentRunToolStub(), newListTaskAgentsToolStub())
 	} else {
-		tools = append(tools, newRunAgentTool(k8sClient, cfg.Resources), newGetAgentRunTool(k8sClient), newListTaskAgentsTool(k8sClient))
+		delegationWatcher = NewDelegationWatcher(k8sClient)
+		tools = append(tools, newRunAgentTool(k8sClient, cfg.Resources), newRunAgentsTool(k8sClient, cfg.Resources, delegationWatcher), newGetAgentRunTool(k8sClient), newListTaskAgentsTool(k8sClient))
 	}
 
 	// Add any extra tools (e.g. memory tools from Engram)
@@ -198,12 +202,13 @@ func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, in
 	)
 
 	return &agentBundle{
-		agent:     fantasy.NewAgent(model, opts...),
-		providers: providers,
-		mcpConns:  allMCPConns,
-		toolCount: len(tools),
-		baseTools: tools,
-		baseOpts:  opts,
+		agent:             fantasy.NewAgent(model, opts...),
+		providers:         providers,
+		mcpConns:          allMCPConns,
+		toolCount:         len(tools),
+		baseTools:         tools,
+		baseOpts:          opts,
+		delegationWatcher: delegationWatcher,
 	}, nil
 }
 
@@ -487,7 +492,36 @@ func runDaemon() error {
 		budget:      ctxBudget,
 		activeModel: cfg.PrimaryModel,
 		agentName:   agentName,
+		delegation:  bundle.delegationWatcher,
 		convCtx:     &sessionContext{},
+	}
+
+	// Wire up the DelegationWatcher trigger and emitter functions.
+	// The trigger queues delegation results as a steer message when the agent
+	// is busy, or starts a new internal prompt when idle.
+	if srv.delegation != nil {
+		srv.delegation.SetTrigger(func(prompt string) {
+			sc := srv.convCtx
+			sc.mu.Lock()
+			if sc.busy {
+				// Agent is busy — queue as steer message for injection at next step boundary
+				sc.steerMsg = prompt
+				sc.mu.Unlock()
+				slog.Info("delegation callback queued as steer (agent busy)")
+				return
+			}
+			sc.mu.Unlock()
+
+			// Agent is idle — trigger a new prompt via the streaming endpoint internally
+			go srv.handleInternalPrompt(prompt)
+		})
+
+		srv.delegation.SetEmitterFn(func() *fepEmitter {
+			srv.convCtx.mu.Lock()
+			emit := srv.convCtx.emitter
+			srv.convCtx.mu.Unlock()
+			return emit
+		})
 	}
 
 	// Initialize permission gate (emits permission_asked via the active SSE emitter)
@@ -553,6 +587,14 @@ func runDaemon() error {
 		}
 	}
 
+	// Restore delegation groups from checkpoint (crash recovery).
+	// Must happen after watcher trigger/emitter are wired up.
+	if srv.delegation != nil {
+		if groups := RestoreDelegationCheckpoint(); len(groups) > 0 {
+			srv.delegation.RestoreGroups(groups)
+		}
+	}
+
 	mux := http.NewServeMux()
 
 	// Prompt endpoints (single conversation per agent — no session ID needed)
@@ -582,6 +624,12 @@ func runDaemon() error {
 	go func() {
 		<-ctx.Done()
 		slog.Info("shutting down...")
+
+		// Stop delegation watcher and cancel active watches
+		if srv.delegation != nil {
+			SaveDelegationCheckpoint(srv.delegation.CheckpointGroups())
+			srv.delegation.Stop()
+		}
 
 		// Save working memory checkpoint to PVC for crash recovery
 		srv.memory.SaveCheckpoint()
@@ -637,6 +685,7 @@ type daemonServer struct {
 	lastTraceID  string // trace ID of the most recent prompt execution
 	permGate     *permissionGate
 	questionGate *questionGate
+	delegation   *DelegationWatcher // tracks parallel fan-out delegation groups
 
 	mu      sync.Mutex
 	convCtx *sessionContext // single conversation context
@@ -1142,6 +1191,110 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 
 	// Emit idle
 	emit.emitSessionIdle(s.agentName)
+}
+
+// handleInternalPrompt runs the agent loop with an internal prompt (no HTTP request).
+// Used by the DelegationWatcher to inject delegation results when the agent is idle.
+// This follows the same flow as handlePrompt (non-streaming) to avoid requiring an
+// active SSE connection. Results are appended to working memory.
+func (s *daemonServer) handleInternalPrompt(prompt string) {
+	sc := s.convCtx
+	sc.mu.Lock()
+	if sc.busy {
+		// Race: agent became busy between our check and now — fall back to steer
+		sc.steerMsg = prompt
+		sc.mu.Unlock()
+		slog.Info("delegation callback fell back to steer (agent became busy)")
+		return
+	}
+	sc.busy = true
+	sc.mu.Unlock()
+
+	defer func() {
+		sc.mu.Lock()
+		sc.busy = false
+		sc.cancel = nil
+		sc.mu.Unlock()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	sc.mu.Lock()
+	sc.cancel = cancel
+	sc.mu.Unlock()
+	defer cancel()
+
+	// Start tracing span
+	ctx, promptSpan := tracer.Start(ctx, "agent.prompt.internal", trace.WithAttributes(
+		attrAgentName.String(s.agentName),
+		attrAgentMode.String("daemon"),
+		attrGenAIOperationName.String("invoke_agent"),
+		attribute.String("prompt.source", "delegation_callback"),
+	))
+	defer promptSpan.End()
+
+	recordPromptEvent(promptSpan, prompt)
+
+	// Get messages from working memory
+	messages := s.memory.Messages()
+
+	// Set per-turn context
+	var memoryCtx string
+	if s.engram != nil {
+		contextLimit := 5
+		if s.cfg.Memory != nil && s.cfg.Memory.ContextLimit > 0 {
+			contextLimit = s.cfg.Memory.ContextLimit
+		}
+		memoryCtx = s.engram.FetchContext(ctx, contextLimit, prompt)
+	}
+	s.injector.Set(memoryCtx, "")
+	defer s.injector.Clear()
+
+	// Pre-flight budget
+	s.budget.UpdatePerTurn(memoryCtx, "", prompt, messages)
+	convBudget := s.budget.ConversationBudget()
+	if trimmed, _ := s.memory.TrimToTokenBudget(convBudget); trimmed > 0 {
+		messages = s.memory.Messages()
+		s.budget.UpdatePerTurn(memoryCtx, "", prompt, messages)
+	}
+
+	result, usedModel, err := generateWithFallback(ctx, s.cfg, s.bundle, fantasy.AgentCall{
+		Prompt:   prompt,
+		Messages: messages,
+	})
+	if err != nil {
+		recordError(promptSpan, err)
+		slog.Error("delegation callback prompt failed", "error", err)
+		return
+	}
+
+	// Append to working memory
+	s.memory.Append(fantasy.NewUserMessage(prompt))
+	for _, step := range result.Steps {
+		s.memory.Append(step.Messages...)
+	}
+	s.memory.CompleteTurn()
+
+	traceID := traceIDFromContext(ctx)
+
+	s.mu.Lock()
+	s.activeModel = usedModel
+	s.totalSteps += len(result.Steps)
+	s.lastTraceID = traceID
+	s.mu.Unlock()
+
+	promptSpan.SetAttributes(
+		attrGenAIResponseModel.String(usedModel),
+		attrGenAIInputTokens.Int64(result.TotalUsage.InputTokens),
+		attrGenAIOutputTokens.Int64(result.TotalUsage.OutputTokens),
+		attribute.Int("agent.steps", len(result.Steps)),
+	)
+
+	recordCompletionEvent(promptSpan, result.Response.Content.Text())
+	slog.Info("delegation callback prompt completed",
+		"model", usedModel,
+		"steps", len(result.Steps),
+		"traceId", traceID,
+	)
 }
 
 // ── Steer handler ──

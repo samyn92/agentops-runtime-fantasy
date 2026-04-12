@@ -9,6 +9,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -17,6 +19,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 )
@@ -325,7 +328,11 @@ type AgentRunStatus struct {
 // CreateAgentRun creates an AgentRun CR. If gitParams is non-nil, spec.git is populated.
 // traceparent is the W3C trace context string from the calling agent's span (may be empty).
 func (k *K8sClient) CreateAgentRun(ctx context.Context, agentRef, prompt, source, sourceRef, traceparent string, gitParams *AgentRunGitParams) (*AgentRunResult, error) {
-	name := fmt.Sprintf("%s-run-%d", agentRef, time.Now().UnixMilli())
+	// Random 4-byte suffix prevents name collisions when multiple runs
+	// are created in the same millisecond (e.g. parallel fan-out).
+	var suffix [4]byte
+	_, _ = rand.Read(suffix[:])
+	name := fmt.Sprintf("%s-run-%d-%s", agentRef, time.Now().UnixMilli(), hex.EncodeToString(suffix[:]))
 
 	spec := map[string]interface{}{
 		"agentRef":  agentRef,
@@ -400,4 +407,13 @@ func (k *K8sClient) GetAgentRun(ctx context.Context, name string) (*AgentRunStat
 	json.Unmarshal(data, &result)
 
 	return &result, nil
+}
+
+// WatchAgentRun starts a Kubernetes Watch on a specific AgentRun CR.
+// The returned watch.Interface emits events when the CR changes.
+// The caller must call Stop() on the returned interface when done.
+func (k *K8sClient) WatchAgentRun(ctx context.Context, name string) (watch.Interface, error) {
+	return k.client.Resource(agentRunGVR).Namespace(k.namespace).Watch(ctx, metav1.ListOptions{
+		FieldSelector: "metadata.name=" + name,
+	})
 }
