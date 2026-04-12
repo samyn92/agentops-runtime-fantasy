@@ -233,6 +233,17 @@ func newMCPToolAdapter(session *mcp.ClientSession, serverName string, tool *mcp.
 	}
 }
 
+// mcpPrefixedName builds the LLM-facing tool name with the "mcp_<server>_" prefix.
+// If the tool name already starts with "<server>_" (common MCP convention), the
+// server prefix is not duplicated: e.g. server="gitlab", tool="gitlab_add_issue_note"
+// → "mcp_gitlab_add_issue_note" (not "mcp_gitlab_gitlab_add_issue_note").
+func (m *mcpToolAdapter) mcpPrefixedName() string {
+	if strings.HasPrefix(m.mcpTool.Name, m.serverName+"_") {
+		return "mcp_" + m.mcpTool.Name
+	}
+	return fmt.Sprintf("mcp_%s_%s", m.serverName, m.mcpTool.Name)
+}
+
 func (m *mcpToolAdapter) Info() fantasy.ToolInfo {
 	params := make(map[string]any)
 	var required []string
@@ -250,7 +261,7 @@ func (m *mcpToolAdapter) Info() fantasy.ToolInfo {
 	}
 
 	return fantasy.ToolInfo{
-		Name:        fmt.Sprintf("mcp_%s_%s", m.serverName, m.mcpTool.Name),
+		Name:        m.mcpPrefixedName(),
 		Description: m.mcpTool.Description,
 		Parameters:  params,
 		Required:    required,
@@ -264,7 +275,7 @@ func (m *mcpToolAdapter) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 	}
 
 	// Start a child span for the MCP protocol call with server-specific attributes
-	prefixedName := fmt.Sprintf("mcp_%s_%s", m.serverName, m.mcpTool.Name)
+	prefixedName := m.mcpPrefixedName()
 	ctx, span := tracer.Start(ctx, "mcp.call: "+m.serverName+"/"+m.mcpTool.Name)
 	defer span.End()
 
