@@ -15,7 +15,7 @@ type Config struct {
 	FallbackModels  []string        `json:"fallbackModels,omitempty"`
 	TitleModel      string          `json:"titleModel,omitempty"` // fast/cheap model for auto-titling; defaults to primaryModel
 	SystemPrompt    string          `json:"systemPrompt,omitempty"`
-	BuiltinTools    []string        `json:"builtinTools,omitempty"`
+	BuiltinTools    []string        `json:"builtinTools"`
 	Tools           []ToolEntry     `json:"tools"`
 	MCPServers      []MCPEntry      `json:"mcpServers,omitempty"`
 	ToolHooks       *ToolHooksEntry `json:"toolHooks,omitempty"`

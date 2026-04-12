@@ -395,7 +395,7 @@ func runDaemon() error {
 	slog.Info("starting Fantasy daemon agent",
 		"model", cfg.PrimaryModel,
 		"providers", len(cfg.Providers),
-		"builtinTools", len(cfg.BuiltinTools),
+		"builtinTools", builtinToolCount(cfg.BuiltinTools),
 		"ociTools", len(cfg.Tools),
 		"mcpServers", len(cfg.MCPServers),
 		"fallbackModels", len(cfg.FallbackModels),

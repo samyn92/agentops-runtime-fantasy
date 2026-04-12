@@ -22,8 +22,12 @@ import (
 )
 
 // buildBuiltinTools returns the requested built-in tools.
-// If names is empty, all built-in tools are returned (operator may omit the list).
+// No tools are granted by default — only explicitly listed tools are enabled.
 func buildBuiltinTools(names []string) []fantasy.AgentTool {
+	if len(names) == 0 {
+		return nil
+	}
+
 	registry := map[string]fantasy.AgentTool{
 		"bash":  newBashTool(),
 		"read":  newReadTool(),
@@ -35,15 +39,6 @@ func buildBuiltinTools(names []string) []fantasy.AgentTool {
 		"fetch": newFetchTool(),
 	}
 
-	// Default to all tools when operator doesn't pass the list
-	if len(names) == 0 {
-		tools := make([]fantasy.AgentTool, 0, len(registry))
-		for _, t := range registry {
-			tools = append(tools, t)
-		}
-		return tools
-	}
-
 	var tools []fantasy.AgentTool
 	for _, name := range names {
 		if t, ok := registry[name]; ok {
@@ -53,7 +48,10 @@ func buildBuiltinTools(names []string) []fantasy.AgentTool {
 	return tools
 }
 
-// ── bash ──
+// builtinToolCount returns the number of configured builtin tools for logging.
+func builtinToolCount(names []string) int {
+	return len(names)
+}
 
 type bashInput struct {
 	Command string `json:"command" description:"The bash command to execute"`
