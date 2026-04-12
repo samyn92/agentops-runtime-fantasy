@@ -63,7 +63,7 @@ func initTracing(ctx context.Context, agentName, agentNamespace, agentMode strin
 	// Build resource attributes
 	attrs := []attribute.KeyValue{
 		semconv.ServiceName("agentops-runtime"),
-		semconv.ServiceVersion("0.1.0"),
+		semconv.ServiceVersion(version),
 		attribute.String("agent.name", agentName),
 		attribute.String("agent.mode", agentMode),
 	}

@@ -26,6 +26,10 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// version is set at build time via -ldflags="-X main.version=..."
+// Falls back to "dev" for local builds without ldflags.
+var version = "dev"
+
 const (
 	configPath = "/etc/operator/config.json"
 	port       = 4096

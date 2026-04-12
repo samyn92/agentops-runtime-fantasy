@@ -158,7 +158,7 @@ func waitForGateway(ctx context.Context, port int, timeout time.Duration) error 
 
 // startStdioMCP starts an MCP server process and connects via stdio.
 func startStdioMCP(ctx context.Context, name, binPath string) (*mcpConnection, error) {
-	impl := &mcp.Implementation{Name: "agentops-fantasy", Version: "0.1.0"}
+	impl := &mcp.Implementation{Name: "agentops-fantasy", Version: version}
 	client := mcp.NewClient(impl, nil)
 
 	transport := &mcp.CommandTransport{
@@ -179,7 +179,7 @@ func startStdioMCP(ctx context.Context, name, binPath string) (*mcpConnection, e
 
 // startStreamableMCP connects to an MCP server via Streamable HTTP transport.
 func startStreamableMCP(ctx context.Context, name, mcpURL string) (*mcpConnection, error) {
-	impl := &mcp.Implementation{Name: "agentops-fantasy", Version: "0.1.0"}
+	impl := &mcp.Implementation{Name: "agentops-fantasy", Version: version}
 	client := mcp.NewClient(impl, nil)
 
 	transport := &mcp.StreamableClientTransport{
