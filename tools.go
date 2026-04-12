@@ -10,6 +10,8 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -387,6 +389,9 @@ func newFetchTool() fantasy.AgentTool {
 			if input.URL == "" {
 				return fantasy.NewTextErrorResponse("url is required"), nil
 			}
+			if err := validateFetchURL(input.URL); err != nil {
+				return fantasy.NewTextErrorResponse(fmt.Sprintf("blocked: %s", err)), nil
+			}
 			cmd := exec.CommandContext(ctx, "curl", "-sSL", "--max-time", "30", input.URL)
 			out, err := cmd.CombinedOutput()
 
@@ -402,6 +407,50 @@ func newFetchTool() fantasy.AgentTool {
 			result := fantasy.NewTextResponse(string(out))
 			return fantasy.WithResponseMetadata(result, metadata), nil
 		})
+}
+
+// validateFetchURL blocks requests to internal/metadata endpoints to prevent SSRF.
+func validateFetchURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %s", err)
+	}
+
+	// Only allow http/https
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("scheme %q not allowed, only http/https", u.Scheme)
+	}
+
+	host := u.Hostname()
+
+	// Block cloud metadata endpoints
+	metadataHosts := []string{
+		"169.254.169.254", // AWS/GCP/Azure metadata
+		"metadata.google.internal",
+		"metadata.internal",
+	}
+	for _, mh := range metadataHosts {
+		if strings.EqualFold(host, mh) {
+			return fmt.Errorf("access to metadata endpoint %q is blocked", host)
+		}
+	}
+
+	// Resolve and block private/loopback IPs
+	ips, err := net.LookupHost(host)
+	if err != nil {
+		// If we can't resolve, let curl try (it'll fail on its own)
+		return nil
+	}
+	for _, ipStr := range ips {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			continue
+		}
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return fmt.Errorf("access to internal address %s (%s) is blocked", host, ipStr)
+		}
+	}
+	return nil
 }
 
 // ── helpers ──

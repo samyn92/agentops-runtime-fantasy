@@ -78,6 +78,10 @@ type agentBundle struct {
 	providers map[string]fantasy.Provider
 	mcpConns  []mcpConnection
 	toolCount int // number of tools registered (for budget estimation)
+	// baseTools and baseOpts are preserved for rebuilding with permission gates / question tool.
+	// This ensures the rebuild never diverges from the primary path.
+	baseTools []fantasy.AgentTool
+	baseOpts  []fantasy.AgentOption
 }
 
 func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, injector *contextInjector, extraTools ...fantasy.AgentTool) (*agentBundle, error) {
@@ -198,6 +202,8 @@ func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, in
 		providers: providers,
 		mcpConns:  allMCPConns,
 		toolCount: len(tools),
+		baseTools: tools,
+		baseOpts:  opts,
 	}, nil
 }
 
@@ -508,112 +514,43 @@ func runDaemon() error {
 		},
 	)
 
-	// Apply permission wrapping if configured
-	if len(cfg.PermissionTools) > 0 {
-		agent := bundle.agent
-		opts := []fantasy.AgentOption{}
-
-		// Rebuild tools with permission gates applied
-		tools := buildBuiltinTools(cfg.BuiltinTools)
-		if len(cfg.Tools) > 0 {
-			ociTools, _, _ := loadOCITools(ctx, cfg.Tools)
-			tools = append(tools, ociTools...)
-		}
-		if len(cfg.MCPServers) > 0 {
-			gwTools, _, _ := loadGatewayMCPTools(ctx, cfg.MCPServers)
-			tools = append(tools, gwTools...)
-		}
-
-		// Add orchestration tools
-		k8sClient, _ := NewK8sClient()
-		if k8sClient != nil {
-			tools = append(tools, newRunAgentTool(k8sClient, cfg.Resources), newGetAgentRunTool(k8sClient))
-		}
+	// Apply permission wrapping and/or question tool if configured.
+	// Uses baseTools and baseOpts from the primary build path to ensure
+	// no tools or options are silently lost (git tools, listTaskAgents,
+	// InputTokenBudget, PrepareStep, etc.).
+	if len(cfg.PermissionTools) > 0 || cfg.EnableQuestionTool {
+		tools := make([]fantasy.AgentTool, len(bundle.baseTools))
+		copy(tools, bundle.baseTools)
 
 		// Add question tool if enabled
 		if cfg.EnableQuestionTool {
 			tools = append(tools, newQuestionTool(srv.questionGate))
 		}
 
-		// Add memory tools (fix: these were missing in agent rebuild, causing
-		// agents with permission gates to silently lose mem_save/mem_search/mem_context)
-		tools = append(tools, buildMemoryTools(engram)...)
-
-		// Wrap ALL tools with hooks (tracing + truncation) BEFORE permission gates
-		tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars, srv.engram)
-
-		// Wrap with permission gates (on top of hook-wrapped tools)
-		tools = srv.permGate.wrapTools(tools, cfg.PermissionTools)
-
-		opts = append(opts, fantasy.WithTools(tools...))
-		if cfg.SystemPrompt != "" {
-			opts = append(opts, fantasy.WithSystemPrompt(cfg.SystemPrompt))
-		}
-		if cfg.Temperature != nil {
-			opts = append(opts, fantasy.WithTemperature(*cfg.Temperature))
-		}
-		if cfg.MaxOutputTokens != nil {
-			opts = append(opts, fantasy.WithMaxOutputTokens(*cfg.MaxOutputTokens))
-		}
-		if cfg.MaxSteps != nil {
-			opts = append(opts, fantasy.WithStopConditions(fantasy.StepCountIs(*cfg.MaxSteps)))
+		// Wrap with permission gates if configured
+		if len(cfg.PermissionTools) > 0 {
+			tools = srv.permGate.wrapTools(tools, cfg.PermissionTools)
 		}
 
-		// Resolve model
-		model, _ := resolveModel(ctx, cfg.PrimaryModel, bundle.providers, cfg.PrimaryProvider)
-		if model != nil {
-			bundle.agent = fantasy.NewAgent(model, opts...)
-		} else {
-			_ = agent // keep original if model resolution fails
-		}
-
-		slog.Info("permission gates applied", "tools", cfg.PermissionTools)
-	} else if cfg.EnableQuestionTool {
-		// Only need to add question tool (no permission wrapping needed)
-		// Rebuild agent with question tool added
-		tools := buildBuiltinTools(cfg.BuiltinTools)
-		if len(cfg.Tools) > 0 {
-			ociTools, _, _ := loadOCITools(ctx, cfg.Tools)
-			tools = append(tools, ociTools...)
-		}
-		if len(cfg.MCPServers) > 0 {
-			gwTools, _, _ := loadGatewayMCPTools(ctx, cfg.MCPServers)
-			tools = append(tools, gwTools...)
-		}
-
-		k8sClient, _ := NewK8sClient()
-		if k8sClient != nil {
-			tools = append(tools, newRunAgentTool(k8sClient, cfg.Resources), newGetAgentRunTool(k8sClient))
-		}
-
-		tools = append(tools, newQuestionTool(srv.questionGate))
-
-		// Add memory tools (fix: these were missing in question-tool-only rebuild)
-		tools = append(tools, buildMemoryTools(engram)...)
-
-		// Wrap ALL tools with hooks (tracing + truncation)
-		tools = wrapToolsWithHooks(tools, cfg.ToolHooks, cfg.MaxToolResultChars, srv.engram)
-
+		// Rebuild agent with the augmented tools but all original options preserved.
+		// Filter out the old WithTools option and replace with the new tool set.
 		opts := []fantasy.AgentOption{fantasy.WithTools(tools...)}
-		if cfg.SystemPrompt != "" {
-			opts = append(opts, fantasy.WithSystemPrompt(cfg.SystemPrompt))
-		}
-		if cfg.Temperature != nil {
-			opts = append(opts, fantasy.WithTemperature(*cfg.Temperature))
-		}
-		if cfg.MaxOutputTokens != nil {
-			opts = append(opts, fantasy.WithMaxOutputTokens(*cfg.MaxOutputTokens))
-		}
-		if cfg.MaxSteps != nil {
-			opts = append(opts, fantasy.WithStopConditions(fantasy.StepCountIs(*cfg.MaxSteps)))
+		for _, opt := range bundle.baseOpts {
+			opts = append(opts, opt)
 		}
 
 		model, _ := resolveModel(ctx, cfg.PrimaryModel, bundle.providers, cfg.PrimaryProvider)
 		if model != nil {
 			bundle.agent = fantasy.NewAgent(model, opts...)
+			bundle.toolCount = len(tools)
 		}
 
-		slog.Info("question tool enabled")
+		if len(cfg.PermissionTools) > 0 {
+			slog.Info("permission gates applied", "tools", cfg.PermissionTools)
+		}
+		if cfg.EnableQuestionTool {
+			slog.Info("question tool enabled")
+		}
 	}
 
 	mux := http.NewServeMux()
