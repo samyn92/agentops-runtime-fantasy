@@ -175,9 +175,35 @@ func (wm *WorkingMemory) TrimToTokenBudget(budgetTokens int64) (trimmed int, est
 			"estimated_tokens", estimatedTokens,
 			"budget_tokens", budgetTokens,
 		)
+		// Prune toolMeta entries for tool calls no longer in the window.
+		wm.pruneToolMeta()
 	}
 
 	return trimmed, estimatedTokens
+}
+
+// pruneToolMeta removes toolMeta entries whose tool call IDs are no longer
+// referenced by any message in the working memory. Must be called with wm.mu held.
+func (wm *WorkingMemory) pruneToolMeta() {
+	if len(wm.toolMeta) == 0 {
+		return
+	}
+	live := make(map[string]struct{}, len(wm.toolMeta))
+	for _, msg := range wm.messages {
+		for _, part := range msg.Content {
+			switch p := part.(type) {
+			case fantasy.ToolCallPart:
+				live[p.ToolCallID] = struct{}{}
+			case fantasy.ToolResultPart:
+				live[p.ToolCallID] = struct{}{}
+			}
+		}
+	}
+	for id := range wm.toolMeta {
+		if _, ok := live[id]; !ok {
+			delete(wm.toolMeta, id)
+		}
+	}
 }
 
 func (wm *WorkingMemory) Clear() {
@@ -185,6 +211,7 @@ func (wm *WorkingMemory) Clear() {
 	defer wm.mu.Unlock()
 	wm.messages = wm.messages[:0]
 	wm.turnNum = 0
+	wm.toolMeta = make(map[string]string)
 }
 
 // SetSessionID stores the memory service session ID for checkpoint persistence.
@@ -511,7 +538,7 @@ func (ec *EngramClient) get(path string, params url.Values) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20)) // 2 MiB cap
 	if err != nil {
 		return nil, err
 	}
@@ -534,7 +561,7 @@ func (ec *EngramClient) post(path string, payload any) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20)) // 2 MiB cap
 	if err != nil {
 		return nil, err
 	}
