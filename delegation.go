@@ -131,6 +131,11 @@ func newRunAgentsTool(k8s *K8sClient, resources []ResourceEntry, watcher *Delega
 			groupID := uuid.New().String()[:8]
 			traceparent := traceparentFromContext(ctx)
 
+			// Labels to tag every run in this delegation group
+			delegationLabels := map[string]string{
+				"agents.agentops.io/delegation-group": groupID,
+			}
+
 			type createResult struct {
 				index int
 				name  string
@@ -150,7 +155,7 @@ func newRunAgentsTool(k8s *K8sClient, resources []ResourceEntry, watcher *Delega
 						}
 					}
 
-					run, err := k8s.CreateAgentRun(ctx, del.Agent, del.Prompt, "agent", agentName, traceparent, gitParams)
+					run, err := k8s.CreateAgentRun(ctx, del.Agent, del.Prompt, "agent", agentName, traceparent, gitParams, delegationLabels)
 					if err != nil {
 						results <- createResult{index: idx, agent: del.Agent, err: err}
 						return

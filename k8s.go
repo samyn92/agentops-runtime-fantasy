@@ -327,7 +327,8 @@ type AgentRunStatus struct {
 
 // CreateAgentRun creates an AgentRun CR. If gitParams is non-nil, spec.git is populated.
 // traceparent is the W3C trace context string from the calling agent's span (may be empty).
-func (k *K8sClient) CreateAgentRun(ctx context.Context, agentRef, prompt, source, sourceRef, traceparent string, gitParams *AgentRunGitParams) (*AgentRunResult, error) {
+// extraLabels are merged into the CR's metadata.labels (may be nil).
+func (k *K8sClient) CreateAgentRun(ctx context.Context, agentRef, prompt, source, sourceRef, traceparent string, gitParams *AgentRunGitParams, extraLabels map[string]string) (*AgentRunResult, error) {
 	// Random 4-byte suffix prevents name collisions when multiple runs
 	// are created in the same millisecond (e.g. parallel fan-out).
 	var suffix [4]byte
@@ -361,12 +362,17 @@ func (k *K8sClient) CreateAgentRun(ctx context.Context, agentRef, prompt, source
 		annotations["agents.agentops.io/parent-agent"] = sourceRef
 	}
 
+	labels := map[string]interface{}{
+		"agents.agentops.io/agent": agentRef,
+	}
+	for k, v := range extraLabels {
+		labels[k] = v
+	}
+
 	metadata := map[string]interface{}{
 		"name":      name,
 		"namespace": k.namespace,
-		"labels": map[string]interface{}{
-			"agents.agentops.io/agent": agentRef,
-		},
+		"labels":    labels,
 	}
 	if len(annotations) > 0 {
 		metadata["annotations"] = annotations

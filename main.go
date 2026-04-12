@@ -1981,7 +1981,7 @@ func newRunAgentTool(k8s *K8sClient, resources []ResourceEntry) fantasy.AgentToo
 				}
 			}
 
-			run, err := k8s.CreateAgentRun(ctx, input.Agent, input.Prompt, "agent", agentName, traceparentFromContext(ctx), gitParams)
+			run, err := k8s.CreateAgentRun(ctx, input.Agent, input.Prompt, "agent", agentName, traceparentFromContext(ctx), gitParams, nil)
 			if err != nil {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("Failed to create AgentRun: %s", err)), nil
 			}
