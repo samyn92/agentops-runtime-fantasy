@@ -94,13 +94,13 @@ func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, in
 	// Resolve providers
 	providers := make(map[string]fantasy.Provider)
 	for _, p := range cfg.Providers {
-		provider, err := resolveProvider(p.Name)
+		provider, err := resolveProvider(p)
 		if err != nil {
-			slog.Warn("failed to resolve provider", "name", p.Name, "error", err)
+			slog.Warn("failed to resolve provider", "name", p.Name, "type", p.Type, "error", err)
 			continue
 		}
 		providers[p.Name] = provider
-		slog.Info("registered provider", "name", p.Name)
+		slog.Info("registered provider", "name", p.Name, "type", p.Type)
 	}
 
 	// Resolve primary model
@@ -247,7 +247,6 @@ func streamWithFallback(ctx context.Context, cfg *Config, bundle *agentBundle, c
 		attrGenAIOperationName.String("chat"),
 		attrGenAIProviderName.String(detectGenAIProvider(cfg.PrimaryModel, cfg.PrimaryProvider)),
 		attrGenAIRequestModel.String(cfg.PrimaryModel),
-		attrGenAISystem.String(detectGenAISystem(cfg.PrimaryModel, cfg.PrimaryProvider)),
 	))
 	defer span.End()
 
@@ -310,7 +309,6 @@ func generateWithFallback(ctx context.Context, cfg *Config, bundle *agentBundle,
 		attrGenAIOperationName.String("chat"),
 		attrGenAIProviderName.String(detectGenAIProvider(cfg.PrimaryModel, cfg.PrimaryProvider)),
 		attrGenAIRequestModel.String(cfg.PrimaryModel),
-		attrGenAISystem.String(detectGenAISystem(cfg.PrimaryModel, cfg.PrimaryProvider)),
 	))
 	defer span.End()
 

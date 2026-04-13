@@ -73,8 +73,59 @@ type DiscoveryConfig struct {
 }
 
 // ProviderEntry describes a configured provider.
+// The Type field drives type-based SDK dispatch with full configuration
+// (base URL, headers, Vertex/Bedrock config, Responses API, per-call defaults).
 type ProviderEntry struct {
-	Name string `json:"name"`
+	Name            string            `json:"name"`
+	Type            string            `json:"type,omitempty"`
+	BaseURL         string            `json:"baseURL,omitempty"`
+	Headers         map[string]string `json:"headers,omitempty"`
+	Organization    string            `json:"organization,omitempty"`
+	Project         string            `json:"project,omitempty"`
+	UseResponsesAPI bool              `json:"useResponsesAPI,omitempty"`
+	AzureAPIVersion string            `json:"azureAPIVersion,omitempty"`
+	Vertex          *VertexEntry      `json:"vertex,omitempty"`
+	Bedrock         bool              `json:"bedrock,omitempty"`
+	CallDefaults    *CallDefaults     `json:"callDefaults,omitempty"`
+}
+
+// VertexEntry holds Vertex AI config.
+type VertexEntry struct {
+	Project  string `json:"project"`
+	Location string `json:"location"`
+}
+
+// CallDefaults holds per-call options from the Provider CR.
+type CallDefaults struct {
+	Anthropic *AnthropicCallDefaults `json:"anthropic,omitempty"`
+	OpenAI    *OpenAICallDefaults    `json:"openai,omitempty"`
+	Google    *GoogleCallDefaults    `json:"google,omitempty"`
+}
+
+// AnthropicCallDefaults holds Anthropic per-call options.
+type AnthropicCallDefaults struct {
+	Effort                 string `json:"effort,omitempty"`
+	ThinkingBudgetTokens   *int64 `json:"thinkingBudgetTokens,omitempty"`
+	DisableParallelToolUse *bool  `json:"disableParallelToolUse,omitempty"`
+}
+
+// OpenAICallDefaults holds OpenAI per-call options.
+type OpenAICallDefaults struct {
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	ServiceTier     string `json:"serviceTier,omitempty"`
+}
+
+// GoogleCallDefaults holds Google per-call options.
+type GoogleCallDefaults struct {
+	ThinkingLevel        string                `json:"thinkingLevel,omitempty"`
+	ThinkingBudgetTokens *int64                `json:"thinkingBudgetTokens,omitempty"`
+	SafetySettings       []GoogleSafetySetting `json:"safetySettings,omitempty"`
+}
+
+// GoogleSafetySetting configures a safety threshold for a harm category.
+type GoogleSafetySetting struct {
+	Category  string `json:"category"`
+	Threshold string `json:"threshold"`
 }
 
 // ToolEntry describes a tool package path (MCP server in OCI).

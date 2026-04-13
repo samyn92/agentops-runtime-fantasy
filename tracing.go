@@ -130,7 +130,6 @@ var (
 // GenAI semantic convention attributes
 // See: https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/
 var (
-	attrGenAISystem          = attribute.Key("gen_ai.system")         // deprecated alias; use provider.name
 	attrGenAIOperationName   = attribute.Key("gen_ai.operation.name") // Required: "chat", "invoke_agent", "execute_tool"
 	attrGenAIProviderName    = attribute.Key("gen_ai.provider.name")  // Required: "anthropic", "openai", etc.
 	attrGenAIRequestModel    = attribute.Key("gen_ai.request.model")
@@ -349,12 +348,6 @@ func detectGenAIProvider(model, provider string) string {
 		return provider
 	}
 	return "unknown"
-}
-
-// detectGenAISystem is a backward-compatible alias for detectGenAIProvider.
-// Deprecated: use detectGenAIProvider instead.
-func detectGenAISystem(model, provider string) string {
-	return detectGenAIProvider(model, provider)
 }
 
 // ────────────────────────────────────────────────────────────────────
