@@ -22,7 +22,9 @@ import (
 	"time"
 
 	"charm.land/fantasy"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -258,9 +260,14 @@ func streamWithFallback(ctx context.Context, cfg *Config, bundle *agentBundle, c
 		span.SetAttributes(attrGenAIMaxTokens.Int64(*cfg.MaxOutputTokens))
 	}
 
+	provider := detectGenAIProvider(cfg.PrimaryModel, cfg.PrimaryProvider)
+	start := time.Now()
+
 	result, err := bundle.agent.Stream(ctx, call)
 	if err == nil {
+		elapsed := time.Since(start)
 		setLLMResultAttributes(span, result, cfg.PrimaryModel)
+		recordGenAIMetrics(ctx, elapsed, result, cfg.PrimaryModel, provider, "chat")
 		return result, cfg.PrimaryModel, nil
 	}
 
@@ -320,9 +327,14 @@ func generateWithFallback(ctx context.Context, cfg *Config, bundle *agentBundle,
 		span.SetAttributes(attrGenAIMaxTokens.Int64(*cfg.MaxOutputTokens))
 	}
 
+	provider := detectGenAIProvider(cfg.PrimaryModel, cfg.PrimaryProvider)
+	start := time.Now()
+
 	result, err := bundle.agent.Generate(ctx, call)
 	if err == nil {
+		elapsed := time.Since(start)
 		setLLMResultAttributes(span, result, cfg.PrimaryModel)
+		recordGenAIMetrics(ctx, elapsed, result, cfg.PrimaryModel, provider, "chat")
 		return result, cfg.PrimaryModel, nil
 	}
 
@@ -628,7 +640,9 @@ func runDaemon() error {
 	// AI-assisted memory extraction
 	mux.HandleFunc("POST /memory/extract", srv.handleMemoryExtract)
 
-	httpSrv := &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: mux}
+	httpSrv := &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: otelhttp.NewHandler(mux, "agentops-runtime",
+		otelhttp.WithMessageEvents(otelhttp.ReadEvents, otelhttp.WriteEvents),
+	)}
 
 	go func() {
 		<-ctx.Done()
@@ -760,6 +774,13 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 			attrGenAIRequestModel.String(s.cfg.PrimaryModel),
 		),
 	}
+	// Add GenAI agent semantic convention attributes (agent identity, conversation, server)
+	conversationID := ""
+	if s.engram != nil {
+		conversationID = s.engram.SessionID()
+	}
+	agentNamespace := os.Getenv("AGENT_NAMESPACE")
+	spanOpts = append(spanOpts, trace.WithAttributes(agentSpanAttributes(s.agentName, agentNamespace, conversationID, s.cfg)...))
 	if tp := r.Header.Get("Traceparent"); tp != "" {
 		parentAgent := r.Header.Get("X-AgentOps-Parent-Agent")
 		runName := r.Header.Get("X-AgentOps-Run-Name")
@@ -815,6 +836,24 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 
 	// Record the assistant response as a content event
 	recordCompletionEvent(promptSpan, output)
+
+	// Create retrospective agent.step spans for each step (non-streaming path).
+	// In streaming mode, OnStepStart/OnStepFinish create these in real-time;
+	// here we reconstruct them after the fact so traces show the same structure.
+	for i, step := range result.Steps {
+		_, stepSpan := tracer.Start(ctx, "agent.step", trace.WithAttributes(
+			attrStepNumber.Int(i+1),
+			attrGenAIOperationName.String("agent_step"),
+			attrStepFinishReason.String(string(step.FinishReason)),
+			attrStepToolCalls.Int(len(step.Content.ToolCalls())),
+			attrGenAIInputTokens.Int64(step.Usage.InputTokens),
+			attrGenAIOutputTokens.Int64(step.Usage.OutputTokens),
+		))
+		if step.Usage.ReasoningTokens > 0 {
+			stepSpan.SetAttributes(attrGenAIReasoningTokens.Int64(step.Usage.ReasoningTokens))
+		}
+		stepSpan.End()
+	}
 
 	// Append to working memory
 	s.memory.Append(fantasy.NewUserMessage(req.Prompt))
@@ -893,6 +932,13 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 			attrGenAIRequestModel.String(s.cfg.PrimaryModel),
 		),
 	}
+	// Add GenAI agent semantic convention attributes (agent identity, conversation, server)
+	streamConvID := ""
+	if s.engram != nil {
+		streamConvID = s.engram.SessionID()
+	}
+	streamAgentNS := os.Getenv("AGENT_NAMESPACE")
+	streamSpanOpts = append(streamSpanOpts, trace.WithAttributes(agentSpanAttributes(s.agentName, streamAgentNS, streamConvID, s.cfg)...))
 	if tp := r.Header.Get("Traceparent"); tp != "" {
 		parentAgent := r.Header.Get("X-AgentOps-Parent-Agent")
 		runName := r.Header.Get("X-AgentOps-Run-Name")
@@ -967,6 +1013,10 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 	traceID := traceIDFromContext(ctx)
 	budgetSnap := s.budget.Snapshot()
 	emit.emitAgentStart(s.agentName, req.Prompt, traceID, &budgetSnap)
+
+	// TTFT tracking: record time from stream start to first text token
+	streamStart := time.Now()
+	var ttftOnce sync.Once
 
 	result, usedModel, err := streamWithFallback(ctx, s.cfg, s.bundle, fantasy.AgentStreamCall{
 		Prompt:   req.Prompt,
@@ -1054,6 +1104,23 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 		},
 
 		OnTextDelta: func(id, text string) error {
+			// Record TTFT on the first text delta
+			ttftOnce.Do(func() {
+				elapsed := time.Since(streamStart)
+				if metricTTFT != nil {
+					metricTTFT.Record(ctx, elapsed.Seconds(),
+						metric.WithAttributes(
+							attrGenAIOperationName.String("chat"),
+							attrGenAIRequestModel.String(s.cfg.PrimaryModel),
+							attrGenAIProviderName.String(detectGenAIProvider(s.cfg.PrimaryModel, s.cfg.PrimaryProvider)),
+						),
+					)
+				}
+				promptSpan.AddEvent("gen_ai.first_token", trace.WithAttributes(
+					attribute.Float64("gen_ai.server.time_to_first_token", elapsed.Seconds()),
+				))
+				slog.Info("time to first token recorded", "ttft_s", elapsed.Seconds())
+			})
 			emit.emitTextDelta(id, text)
 			return nil
 		},
@@ -1714,6 +1781,9 @@ func runTask() error {
 			attrGenAIRequestModel.String(cfg.PrimaryModel),
 		),
 	}
+	// Add GenAI agent semantic convention attributes (agent identity, server address).
+	// Conversation ID is set later once engram is initialized.
+	spanOpts = append(spanOpts, trace.WithAttributes(agentSpanAttributes(agentName, agentNamespace, "", cfg)...))
 	if tp := os.Getenv("TRACEPARENT"); tp != "" {
 		parentAgent := os.Getenv("AGENT_RUN_SOURCE_AGENT")
 		runName := os.Getenv("AGENT_RUN_NAME")
@@ -1757,6 +1827,10 @@ func runTask() error {
 		if err := engram.Init(ctx); err != nil {
 			slog.Warn("memory init failed for task, running without memory", "error", err)
 			engram = nil
+		}
+		// Set conversation ID on the root span now that engram is initialized.
+		if engram != nil {
+			promptSpan.SetAttributes(attrGenAIConversationID.String(engram.SessionID()))
 		}
 	}
 
@@ -1803,6 +1877,22 @@ func runTask() error {
 
 	// Record the assistant response as a content event
 	recordCompletionEvent(promptSpan, output)
+
+	// Create retrospective agent.step spans for each step (non-streaming task path).
+	for i, step := range agentResult.Steps {
+		_, stepSpan := tracer.Start(ctx, "agent.step", trace.WithAttributes(
+			attrStepNumber.Int(i+1),
+			attrGenAIOperationName.String("agent_step"),
+			attrStepFinishReason.String(string(step.FinishReason)),
+			attrStepToolCalls.Int(len(step.Content.ToolCalls())),
+			attrGenAIInputTokens.Int64(step.Usage.InputTokens),
+			attrGenAIOutputTokens.Int64(step.Usage.OutputTokens),
+		))
+		if step.Usage.ReasoningTokens > 0 {
+			stepSpan.SetAttributes(attrGenAIReasoningTokens.Int64(step.Usage.ReasoningTokens))
+		}
+		stepSpan.End()
+	}
 
 	result := taskResult{
 		Output:  output,

@@ -286,6 +286,9 @@ func (m *mcpToolAdapter) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 		attrGenAIToolName.String(prefixedName),
 		attrToolTransport.String(m.transport),
 		attrToolType.String("mcp"),
+		// MCP semantic convention attributes
+		attrMCPMethodName.String("tools/call"),
+		attrMCPProtocolVersion.String("2025-03-26"),
 	)
 
 	// Record tool input as a span event

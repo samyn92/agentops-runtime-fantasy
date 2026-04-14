@@ -13,6 +13,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -23,8 +24,11 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
@@ -33,6 +37,17 @@ import (
 
 // Package-level tracer used by all instrumentation points.
 var tracer trace.Tracer
+
+// GenAI metrics — Required by OTel GenAI semantic conventions.
+// See: https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/
+var (
+	// gen_ai.client.operation.duration — histogram of LLM call durations (seconds).
+	metricOperationDuration metric.Float64Histogram
+	// gen_ai.client.token.usage — histogram of token counts per operation.
+	metricTokenUsage metric.Int64Histogram
+	// gen_ai.server.time_to_first_token — histogram of time to first token (seconds).
+	metricTTFT metric.Float64Histogram
+)
 
 // tracingFuncs holds the ForceFlush and Shutdown functions returned by initTracing.
 // ForceFlush must be called before Shutdown in short-lived task pods to ensure
@@ -53,8 +68,9 @@ type tracingFuncs struct {
 func initTracing(ctx context.Context, agentName, agentNamespace, agentMode string) (*tracingFuncs, error) {
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 	if endpoint == "" {
-		// No endpoint configured — use no-op tracer
+		// No endpoint configured — use no-op tracer and metrics
 		tracer = otel.Tracer("agentops-runtime")
+		initNoopMetrics()
 		slog.Info("tracing disabled (OTEL_EXPORTER_OTLP_ENDPOINT not set)")
 		noop := func(context.Context) error { return nil }
 		return &tracingFuncs{ForceFlush: noop, Shutdown: noop}, nil
@@ -106,6 +122,26 @@ func initTracing(ctx context.Context, agentName, agentNamespace, agentMode strin
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 	tracer = tp.Tracer("agentops-runtime")
 
+	// Initialize OTLP gRPC metric exporter and MeterProvider.
+	// GenAI semantic conventions require operation.duration and token.usage histograms.
+	metricExporter, err := otlpmetricgrpc.New(ctx,
+		otlpmetricgrpc.WithEndpoint(endpoint),
+		otlpmetricgrpc.WithInsecure(),
+	)
+	if err != nil {
+		slog.Warn("metric exporter init failed, using noop metrics", "error", err)
+		initNoopMetrics()
+	} else {
+		mp := sdkmetric.NewMeterProvider(
+			sdkmetric.WithResource(res),
+			sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExporter,
+				sdkmetric.WithInterval(10*time.Second),
+			)),
+		)
+		otel.SetMeterProvider(mp)
+		initMetrics(mp.Meter("agentops-runtime"))
+	}
+
 	slog.Info("tracing enabled",
 		"endpoint", endpoint,
 		"agent", agentName,
@@ -113,6 +149,84 @@ func initTracing(ctx context.Context, agentName, agentNamespace, agentMode strin
 	)
 
 	return &tracingFuncs{ForceFlush: tp.ForceFlush, Shutdown: tp.Shutdown}, nil
+}
+
+// initMetrics creates the GenAI metric instruments using a real meter.
+func initMetrics(meter metric.Meter) {
+	var err error
+
+	metricOperationDuration, err = meter.Float64Histogram(
+		"gen_ai.client.operation.duration",
+		metric.WithDescription("Duration of GenAI operations (seconds)"),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		slog.Warn("failed to create operation.duration metric", "error", err)
+	}
+
+	metricTokenUsage, err = meter.Int64Histogram(
+		"gen_ai.client.token.usage",
+		metric.WithDescription("Token usage per GenAI operation"),
+		metric.WithUnit("{token}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create token.usage metric", "error", err)
+	}
+
+	metricTTFT, err = meter.Float64Histogram(
+		"gen_ai.server.time_to_first_token",
+		metric.WithDescription("Time to first token in seconds"),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		slog.Warn("failed to create time_to_first_token metric", "error", err)
+	}
+}
+
+// initNoopMetrics creates noop metric instruments when OTEL is disabled.
+func initNoopMetrics() {
+	meter := otel.Meter("agentops-runtime")
+	initMetrics(meter)
+}
+
+// recordGenAIMetrics records the Required GenAI metrics after a successful LLM call.
+// Must be called from streamWithFallback / generateWithFallback after the call completes.
+func recordGenAIMetrics(ctx context.Context, duration time.Duration, result *fantasy.AgentResult, model, provider, operation string) {
+	if result == nil {
+		return
+	}
+
+	commonAttrs := []attribute.KeyValue{
+		attrGenAIOperationName.String(operation),
+		attrGenAIRequestModel.String(model),
+		attrGenAIProviderName.String(provider),
+	}
+
+	// gen_ai.client.operation.duration — Required histogram
+	if metricOperationDuration != nil {
+		metricOperationDuration.Record(ctx, duration.Seconds(),
+			metric.WithAttributes(commonAttrs...),
+		)
+	}
+
+	// gen_ai.client.token.usage — Required histogram with token.type dimension
+	if metricTokenUsage != nil {
+		if result.TotalUsage.InputTokens > 0 {
+			metricTokenUsage.Record(ctx, result.TotalUsage.InputTokens,
+				metric.WithAttributes(append(commonAttrs, attribute.String("gen_ai.token.type", "input"))...),
+			)
+		}
+		if result.TotalUsage.OutputTokens > 0 {
+			metricTokenUsage.Record(ctx, result.TotalUsage.OutputTokens,
+				metric.WithAttributes(append(commonAttrs, attribute.String("gen_ai.token.type", "output"))...),
+			)
+		}
+		if result.TotalUsage.ReasoningTokens > 0 {
+			metricTokenUsage.Record(ctx, result.TotalUsage.ReasoningTokens,
+				metric.WithAttributes(append(commonAttrs, attribute.String("gen_ai.token.type", "reasoning"))...),
+			)
+		}
+	}
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -124,7 +238,6 @@ var (
 	attrAgentName      = attribute.Key("agent.name")
 	attrAgentNamespace = attribute.Key("agent.namespace")
 	attrAgentMode      = attribute.Key("agent.mode")
-	attrAgentRun       = attribute.Key("agent.run")
 )
 
 // GenAI semantic convention attributes
@@ -145,6 +258,12 @@ var (
 	attrGenAIMaxTokens       = attribute.Key("gen_ai.request.max_tokens")
 	attrGenAIToolName        = attribute.Key("gen_ai.tool.name")
 	attrGenAIToolCallID      = attribute.Key("gen_ai.tool.call.id")
+
+	// GenAI Agent semantic conventions (development status)
+	attrGenAIAgentID        = attribute.Key("gen_ai.agent.id")        // Unique agent identifier (namespace/name)
+	attrGenAIAgentName      = attribute.Key("gen_ai.agent.name")      // Human-readable agent name
+	attrGenAIConversationID = attribute.Key("gen_ai.conversation.id") // Memory session ID — correlates turns
+	attrGenAIServerAddress  = attribute.Key("server.address")         // LLM API endpoint host
 )
 
 // Step attributes
@@ -162,6 +281,15 @@ var (
 	attrToolTransport = attribute.Key("tool.mcp.transport")
 	attrToolError     = attribute.Key("tool.error")
 	attrToolDuration  = attribute.Key("tool.duration_ms")
+)
+
+// MCP semantic convention attributes
+// See: https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp/
+var (
+	attrMCPMethodName      = attribute.Key("mcp.method.name")
+	attrMCPProtocolVersion = attribute.Key("mcp.protocol.version")
+	attrMCPToolCallArgs    = attribute.Key("gen_ai.tool.call.arguments")
+	attrMCPToolCallResult  = attribute.Key("gen_ai.tool.call.result")
 )
 
 // Memory attributes
@@ -198,10 +326,38 @@ func traceIDFromContext(ctx context.Context) string {
 	return sc.TraceID().String()
 }
 
-// recordError sets the span status to Error and records the error as an event.
+// recordError sets the span status to Error, records the error as an event,
+// and sets error.type per OTel semantic conventions.
 func recordError(span trace.Span, err error) {
 	span.SetStatus(codes.Error, err.Error())
 	span.RecordError(err)
+	span.SetAttributes(attribute.String("error.type", errorType(err)))
+}
+
+// errorType classifies an error into a short error.type string per OTel conventions.
+func errorType(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "429") || strings.Contains(s, "rate limit"):
+		return "rate_limited"
+	case strings.Contains(s, "401") || strings.Contains(s, "403"):
+		return "auth_error"
+	case strings.Contains(s, "404"):
+		return "not_found"
+	case strings.Contains(s, "500") || strings.Contains(s, "502") || strings.Contains(s, "503"):
+		return "server_error"
+	case strings.Contains(s, "timeout") || strings.Contains(s, "deadline"):
+		return "timeout"
+	case strings.Contains(s, "connection") || strings.Contains(s, "EOF"):
+		return "connection_error"
+	case strings.Contains(s, "context canceled"):
+		return "cancelled"
+	default:
+		return "error"
+	}
 }
 
 // setLLMResultAttributes sets GenAI semantic convention attributes from a Fantasy AgentResult.
@@ -226,6 +382,15 @@ func setLLMResultAttributes(span trace.Span, result *fantasy.AgentResult, model 
 		attrs = append(attrs, attrGenAICacheRead.Int64(result.TotalUsage.CacheReadTokens))
 	}
 
+	// Extract gen_ai.response.id from the final step's provider metadata.
+	// This is provider-specific but important for correlation.
+	if len(result.Steps) > 0 {
+		lastStep := result.Steps[len(result.Steps)-1]
+		if respID := extractResponseID(lastStep.ProviderMetadata); respID != "" {
+			attrs = append(attrs, attrGenAIResponseID.String(respID))
+		}
+	}
+
 	// Collect finish reasons from steps
 	var finishReasons []string
 	for _, step := range result.Steps {
@@ -245,6 +410,36 @@ func setLLMResultAttributes(span trace.Span, result *fantasy.AgentResult, model 
 	// gen_ai.generate span always survives. The console UI synthesizes
 	// waterfall rows from these events.
 	recordToolCallEventsFromSteps(span, result.Steps)
+}
+
+// extractResponseID attempts to extract a response ID from provider metadata.
+// Checks common provider metadata types for an ID field.
+func extractResponseID(meta fantasy.ProviderMetadata) string {
+	if meta == nil {
+		return ""
+	}
+	// Provider metadata is map[string]any — check for known patterns.
+	for _, v := range meta {
+		if v == nil {
+			continue
+		}
+		// Use reflection-free approach: try JSON round-trip to extract "id" or "response_id".
+		data, err := json.Marshal(v)
+		if err != nil {
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal(data, &m) != nil {
+			continue
+		}
+		if id, ok := m["response_id"].(string); ok && id != "" {
+			return id
+		}
+		if id, ok := m["id"].(string); ok && id != "" {
+			return id
+		}
+	}
+	return ""
 }
 
 // maxToolEventContentLen caps tool input/output stored in tool.call events.
@@ -381,25 +576,30 @@ func truncateContent(s string, maxLen int) string {
 	return s[:maxLen] + "... [truncated]"
 }
 
-// recordPromptEvent records the user prompt as a gen_ai.content.prompt event
-// on the given span, following the OTel GenAI semantic conventions.
+// recordPromptEvent records the user prompt as a gen_ai.user.message event
+// on the given span, following the OTel GenAI semantic conventions for
+// structured input messages.
 func recordPromptEvent(span trace.Span, prompt string) {
 	if prompt == "" {
 		return
 	}
-	span.AddEvent("gen_ai.content.prompt", trace.WithAttributes(
-		attribute.String("gen_ai.prompt", truncateContent(prompt, maxEventContentLen)),
+	span.AddEvent("gen_ai.user.message", trace.WithAttributes(
+		attribute.String("gen_ai.message.role", "user"),
+		attribute.String("gen_ai.message.content", truncateContent(prompt, maxEventContentLen)),
 	))
 }
 
-// recordCompletionEvent records the assistant response as a gen_ai.content.completion
-// event on the given span.
+// recordCompletionEvent records the assistant response as a gen_ai.choice event
+// following the OTel GenAI semantic conventions for structured output messages.
 func recordCompletionEvent(span trace.Span, completion string) {
 	if completion == "" {
 		return
 	}
-	span.AddEvent("gen_ai.content.completion", trace.WithAttributes(
-		attribute.String("gen_ai.completion", truncateContent(completion, maxEventContentLen)),
+	span.AddEvent("gen_ai.choice", trace.WithAttributes(
+		attribute.Int("gen_ai.choice.index", 0),
+		attribute.String("gen_ai.choice.finish_reason", "stop"),
+		attribute.String("gen_ai.choice.message.role", "assistant"),
+		attribute.String("gen_ai.choice.message.content", truncateContent(completion, maxEventContentLen)),
 	))
 }
 
@@ -432,6 +632,77 @@ func recordToolOutputEvent(span trace.Span, toolName, output string, isError boo
 // ────────────────────────────────────────────────────────────────────
 // Root span context — lets tool wrappers record events on the prompt span
 // ────────────────────────────────────────────────────────────────────
+
+// agentSpanAttributes returns standard attributes for agent.prompt root spans
+// following the GenAI Agent semantic conventions. Includes agent identity,
+// conversation correlation, and server address.
+func agentSpanAttributes(agentName, agentNamespace, conversationID string, cfg *Config) []attribute.KeyValue {
+	attrs := []attribute.KeyValue{
+		attrGenAIAgentName.String(agentName),
+	}
+
+	// gen_ai.agent.id — unique agent identifier (namespace/name)
+	agentID := agentName
+	if agentNamespace != "" {
+		agentID = agentNamespace + "/" + agentName
+	}
+	attrs = append(attrs, attrGenAIAgentID.String(agentID))
+
+	// gen_ai.conversation.id — memory session ID correlates turns within a conversation
+	if conversationID != "" {
+		attrs = append(attrs, attrGenAIConversationID.String(conversationID))
+	}
+
+	// server.address — LLM API endpoint host
+	if cfg != nil {
+		if addr := serverAddressFromConfig(cfg); addr != "" {
+			attrs = append(attrs, attrGenAIServerAddress.String(addr))
+		}
+	}
+
+	return attrs
+}
+
+// serverAddressFromConfig extracts the LLM server address from the primary
+// provider's BaseURL config. Returns the host portion only.
+func serverAddressFromConfig(cfg *Config) string {
+	if cfg == nil {
+		return ""
+	}
+	for _, p := range cfg.Providers {
+		if p.Name == cfg.PrimaryProvider || (cfg.PrimaryProvider == "" && len(cfg.Providers) == 1) {
+			if p.BaseURL != "" {
+				// Extract host from URL
+				if idx := strings.Index(p.BaseURL, "://"); idx >= 0 {
+					host := p.BaseURL[idx+3:]
+					if slashIdx := strings.Index(host, "/"); slashIdx >= 0 {
+						host = host[:slashIdx]
+					}
+					// Strip port if present
+					if colonIdx := strings.LastIndex(host, ":"); colonIdx >= 0 {
+						return host[:colonIdx]
+					}
+					return host
+				}
+				return p.BaseURL
+			}
+			// Return well-known endpoint for the provider type
+			switch strings.ToLower(p.Type) {
+			case "anthropic":
+				return "api.anthropic.com"
+			case "openai":
+				return "api.openai.com"
+			case "google", "gemini":
+				return "generativelanguage.googleapis.com"
+			case "deepseek":
+				return "api.deepseek.com"
+			case "openrouter":
+				return "openrouter.ai"
+			}
+		}
+	}
+	return ""
+}
 
 type rootSpanKey struct{}
 

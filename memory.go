@@ -33,7 +33,9 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 // ====================================================================
@@ -294,7 +296,7 @@ func (ec *EngramClient) Init(ctx context.Context) error {
 		"project": ec.project,
 	}
 
-	_, err := ec.post("/sessions", body)
+	_, err := ec.postWithContext(ctx, "/sessions", body)
 	if err != nil {
 		recordError(span, err)
 		return fmt.Errorf("memory init session: %w", err)
@@ -335,7 +337,7 @@ func (ec *EngramClient) FetchContext(ctx context.Context, limit int, query strin
 		span.SetAttributes(attribute.String("memory.context_query", query))
 	}
 
-	resp, err := ec.get("/context", params)
+	resp, err := ec.getWithContext(ctx, "/context", params)
 	if err != nil {
 		slog.Warn("memory fetch context failed", "error", err)
 		recordError(span, err)
@@ -454,7 +456,7 @@ func (ec *EngramClient) SaveObservation(ctx context.Context, obsType, title, con
 		body["tags"] = tags
 	}
 
-	_, err := ec.post("/observations", body)
+	_, err := ec.postWithContext(ctx, "/observations", body)
 	if err != nil {
 		recordError(span, err)
 		return fmt.Errorf("memory save observation: %w", err)
@@ -486,7 +488,7 @@ func (ec *EngramClient) EndSession(ctx context.Context, messages []EngramSession
 		body["messages"] = messages
 	}
 
-	_, err := ec.post("/sessions/"+ec.sessionID+"/end", body)
+	_, err := ec.postWithContext(ctx, "/sessions/"+ec.sessionID+"/end", body)
 	if err != nil {
 		slog.Warn("memory end session failed", "error", err)
 		recordError(span, err)
@@ -556,7 +558,7 @@ func (ec *EngramClient) Search(ctx context.Context, query string, limit int) ([]
 		params.Set("limit", strconv.Itoa(limit))
 	}
 
-	resp, err := ec.get("/search", params)
+	resp, err := ec.getWithContext(ctx, "/search", params)
 	if err != nil {
 		recordError(span, err)
 		return nil, fmt.Errorf("memory search: %w", err)
@@ -584,12 +586,24 @@ type EngramSearchResult struct {
 // ── HTTP helpers ──
 
 func (ec *EngramClient) get(path string, params url.Values) ([]byte, error) {
+	return ec.getWithContext(context.Background(), path, params)
+}
+
+func (ec *EngramClient) getWithContext(ctx context.Context, path string, params url.Values) ([]byte, error) {
 	u := ec.baseURL + path
 	if len(params) > 0 {
 		u += "?" + params.Encode()
 	}
 
-	resp, err := ec.client.Get(u)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Propagate W3C trace context so memory spans link to the calling agent's trace.
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
+
+	resp, err := ec.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -607,12 +621,25 @@ func (ec *EngramClient) get(path string, params url.Values) ([]byte, error) {
 }
 
 func (ec *EngramClient) post(path string, payload any) ([]byte, error) {
+	return ec.postWithContext(context.Background(), path, payload)
+}
+
+func (ec *EngramClient) postWithContext(ctx context.Context, path string, payload any) ([]byte, error) {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := ec.client.Post(ec.baseURL+path, "application/json", bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, "POST", ec.baseURL+path, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// Propagate W3C trace context so memory spans link to the calling agent's trace.
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
+
+	resp, err := ec.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
