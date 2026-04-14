@@ -18,6 +18,7 @@ package main
 
 import (
 	"log/slog"
+	"strings"
 	"sync"
 
 	"charm.land/fantasy"
@@ -73,14 +74,23 @@ const DefaultBudgetFraction = 0.75
 const charsPerToken = 4
 
 // contextWindowForModel returns the known context window size for a model string.
+// Handles provider-prefixed model names (e.g. "kimi/kimi-k2.5" → "kimi-k2.5").
 // Falls back to DefaultContextWindow if the model is not recognized.
 func contextWindowForModel(model string) int64 {
-	if size, ok := modelContextWindows[model]; ok {
+	// Strip provider prefix if present (e.g. "kimi/kimi-k2.5" → "kimi-k2.5",
+	// "anthropic/claude-sonnet-4" → "claude-sonnet-4").
+	bare := model
+	if idx := strings.LastIndex(model, "/"); idx >= 0 {
+		bare = model[idx+1:]
+	}
+
+	// Exact match on bare model name
+	if size, ok := modelContextWindows[bare]; ok {
 		return size
 	}
 	// Try prefix matching for versioned model names (e.g. "claude-opus-4.6@20250901")
 	for prefix, size := range modelContextWindows {
-		if len(model) > len(prefix) && model[:len(prefix)] == prefix {
+		if len(bare) > len(prefix) && bare[:len(prefix)] == prefix {
 			return size
 		}
 	}
