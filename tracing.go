@@ -166,8 +166,22 @@ var (
 
 // Memory attributes
 var (
-	attrMemoryOp      = attribute.Key("memory.operation")
-	attrMemoryProject = attribute.Key("memory.project")
+	attrMemoryOp                = attribute.Key("memory.operation")
+	attrMemoryProject           = attribute.Key("memory.project")
+	attrMemorySessionID         = attribute.Key("memory.session_id")
+	attrMemoryLimit             = attribute.Key("memory.limit")
+	attrMemorySessionsCount     = attribute.Key("memory.sessions_count")
+	attrMemoryObservationsCount = attribute.Key("memory.observations_count")
+	attrMemoryContextLength     = attribute.Key("memory.context_length")
+	attrMemoryContextPreview    = attribute.Key("memory.context_preview")
+	attrMemoryHasContent        = attribute.Key("memory.has_content")
+	attrMemoryObsType           = attribute.Key("memory.observation_type")
+	attrMemoryObsTitle          = attribute.Key("memory.observation_title")
+	attrMemoryContentLength     = attribute.Key("memory.content_length")
+	attrMemoryTags              = attribute.Key("memory.tags")
+	attrMemorySearchQuery       = attribute.Key("memory.search_query")
+	attrMemoryResultCount       = attribute.Key("memory.result_count")
+	attrMemoryMessageCount      = attribute.Key("memory.message_count")
 )
 
 // ────────────────────────────────────────────────────────────────────

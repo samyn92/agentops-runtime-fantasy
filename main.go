@@ -445,7 +445,7 @@ func runDaemon() error {
 			}
 		}
 
-		if err := engram.Init(); err != nil {
+		if err := engram.Init(ctx); err != nil {
 			slog.Warn("memory init failed, running without persistent memory", "error", err)
 			engram = nil
 		}
@@ -645,7 +645,7 @@ func runDaemon() error {
 
 		// End memory session with raw messages for summarization
 		if srv.engram != nil {
-			srv.engram.EndSession(fantasyToEngramMessages(srv.memory.Messages()))
+			srv.engram.EndSession(context.Background(), fantasyToEngramMessages(srv.memory.Messages()))
 		}
 
 		// Flush pending traces before exit
@@ -1754,7 +1754,7 @@ func runTask() error {
 			project = agentName
 		}
 		engram = NewEngramClient(cfg.Memory.ServerURL, project)
-		if err := engram.Init(); err != nil {
+		if err := engram.Init(ctx); err != nil {
 			slog.Warn("memory init failed for task, running without memory", "error", err)
 			engram = nil
 		}
@@ -1835,7 +1835,7 @@ func runTask() error {
 		for _, step := range agentResult.Steps {
 			taskMessages = append(taskMessages, step.Messages...)
 		}
-		engram.EndSession(fantasyToEngramMessages(taskMessages))
+		engram.EndSession(ctx, fantasyToEngramMessages(taskMessages))
 	}
 
 	promptSpan.End()

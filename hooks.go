@@ -95,7 +95,7 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 				span.SetAttributes(attrToolError.Bool(true))
 				span.SetStatus(codes.Error, "blocked command")
 				// Persist security violation to memory (non-blocking)
-				h.saveSecurityObservation(ctx, "blocked_command",
+				h.saveSecurityObservation(ctx, span, "blocked_command",
 					fmt.Sprintf("Blocked command: %s", blocked),
 					fmt.Sprintf("Agent attempted bash command matching blocked pattern.\nPattern: %s\nCommand: %s", blocked, truncateForHook(cmd, 500)),
 				)
@@ -120,7 +120,7 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 				span.SetAttributes(attrToolError.Bool(true))
 				span.SetStatus(codes.Error, "path not allowed")
 				// Persist security violation to memory (non-blocking)
-				h.saveSecurityObservation(ctx, "path_denied",
+				h.saveSecurityObservation(ctx, span, "path_denied",
 					fmt.Sprintf("Path denied: %s via %s", path, toolName),
 					fmt.Sprintf("Agent attempted to access path outside allowlist.\nTool: %s\nPath: %s\nAllowed prefixes: %s", toolName, path, strings.Join(h.hooks.AllowedPaths, ", ")),
 				)
@@ -182,7 +182,7 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 				)
 				// Persist audit trail as a memory observation (searchable via FTS5).
 				// topic_key scoped per-tool so repeated calls upsert (Tier 1 dedup).
-				h.saveAuditObservation(ctx, toolName, elapsed, result.IsError)
+				h.saveAuditObservation(ctx, span, toolName, elapsed, result.IsError)
 				break
 			}
 		}
@@ -229,10 +229,15 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 // saveSecurityObservation persists a security violation as a memory observation.
 // Uses topic_key so repeated violations of the same type upsert (Tier 1 dedup).
 // Non-blocking: logs on failure, never fails the tool call.
-func (h *hookWrappedTool) saveSecurityObservation(ctx context.Context, violation, title, content string) {
+func (h *hookWrappedTool) saveSecurityObservation(ctx context.Context, span trace.Span, violation, title, content string) {
 	if h.engram == nil {
 		return
 	}
+	// Record event synchronously before goroutine to avoid race with span.End()
+	span.AddEvent("hook.security_saved", trace.WithAttributes(
+		attribute.String("violation", violation),
+		attribute.String("title", title),
+	))
 	go func() {
 		body := map[string]any{
 			"session_id": h.engram.SessionID(),
@@ -252,7 +257,7 @@ func (h *hookWrappedTool) saveSecurityObservation(ctx context.Context, violation
 
 // saveAuditObservation persists an audited tool call as a memory observation.
 // Uses topic_key per-tool so the latest call upserts (Tier 1 dedup).
-func (h *hookWrappedTool) saveAuditObservation(ctx context.Context, toolName string, elapsed time.Duration, isError bool) {
+func (h *hookWrappedTool) saveAuditObservation(ctx context.Context, span trace.Span, toolName string, elapsed time.Duration, isError bool) {
 	if h.engram == nil {
 		return
 	}
@@ -260,6 +265,12 @@ func (h *hookWrappedTool) saveAuditObservation(ctx context.Context, toolName str
 	if isError {
 		status = "error"
 	}
+	// Record event synchronously before goroutine to avoid race with span.End()
+	span.AddEvent("hook.audit_saved", trace.WithAttributes(
+		attribute.String("tool", toolName),
+		attribute.String("status", status),
+		attribute.Int64("duration_ms", elapsed.Milliseconds()),
+	))
 	go func() {
 		body := map[string]any{
 			"session_id": h.engram.SessionID(),
@@ -285,9 +296,18 @@ func (h *hookWrappedTool) applyMemorySaveRule(ctx context.Context, span trace.Sp
 		matched, err := regexp.MatchString(rule.MatchOutput, result.Content)
 		if err != nil {
 			slog.Warn("hook: invalid matchOutput regex", "pattern", rule.MatchOutput, "error", err)
+			span.AddEvent("hook.memory_save_skipped", trace.WithAttributes(
+				attribute.String("tool", toolName),
+				attribute.String("reason", "invalid_regex"),
+				attribute.String("pattern", rule.MatchOutput),
+			))
 			return
 		}
 		if !matched {
+			span.AddEvent("hook.memory_save_skipped", trace.WithAttributes(
+				attribute.String("tool", toolName),
+				attribute.String("reason", "output_not_matched"),
+			))
 			return
 		}
 	}
@@ -297,10 +317,20 @@ func (h *hookWrappedTool) applyMemorySaveRule(ctx context.Context, span trace.Sp
 		for argKey, argPattern := range rule.MatchArgs {
 			argVal, _ := args[argKey].(string)
 			if argVal == "" {
+				span.AddEvent("hook.memory_save_skipped", trace.WithAttributes(
+					attribute.String("tool", toolName),
+					attribute.String("reason", "arg_missing"),
+					attribute.String("arg", argKey),
+				))
 				return // arg not present — skip
 			}
 			matched, err := regexp.MatchString(argPattern, argVal)
 			if err != nil || !matched {
+				span.AddEvent("hook.memory_save_skipped", trace.WithAttributes(
+					attribute.String("tool", toolName),
+					attribute.String("reason", "arg_not_matched"),
+					attribute.String("arg", argKey),
+				))
 				return
 			}
 		}
@@ -326,6 +356,14 @@ func (h *hookWrappedTool) applyMemorySaveRule(ctx context.Context, span trace.Sp
 	// Content: truncated output (enough to be useful, not overwhelming)
 	content := truncateForHook(result.Content, 1000)
 
+	// Record the event synchronously BEFORE the goroutine to avoid race with span.End()
+	span.AddEvent("hook.memory_saved", trace.WithAttributes(
+		attribute.String("tool", toolName),
+		attribute.String("type", obsType),
+		attribute.String("title", title),
+		attribute.Int("content_length", len(content)),
+	))
+
 	go func() {
 		body := map[string]any{
 			"session_id": h.engram.SessionID(),
@@ -339,11 +377,6 @@ func (h *hookWrappedTool) applyMemorySaveRule(ctx context.Context, span trace.Sp
 		if _, err := h.engram.post("/observations", body); err != nil {
 			slog.Warn("hook: failed to save memory save rule observation", "error", err, "tool", toolName)
 		} else {
-			span.AddEvent("hook.memory_saved", trace.WithAttributes(
-				attribute.String("tool", toolName),
-				attribute.String("type", obsType),
-				attribute.String("title", title),
-			))
 			slog.Info("hook: memory save rule triggered", "tool", toolName, "type", obsType)
 		}
 	}()
@@ -369,6 +402,10 @@ func (h *hookWrappedTool) injectContextFromMemory(ctx context.Context, span trac
 		query = rule.Query // static query string
 	}
 	if query == "" {
+		span.AddEvent("hook.context_inject_skipped", trace.WithAttributes(
+			attribute.String("tool", toolName),
+			attribute.String("reason", "empty_query"),
+		))
 		return
 	}
 
@@ -379,6 +416,10 @@ func (h *hookWrappedTool) injectContextFromMemory(ctx context.Context, span trac
 
 	memCtx := h.engram.FetchContext(ctx, limit, query)
 	if memCtx == "" {
+		span.AddEvent("hook.context_inject_empty", trace.WithAttributes(
+			attribute.String("tool", toolName),
+			attribute.String("query", truncateForHook(query, 200)),
+		))
 		return
 	}
 

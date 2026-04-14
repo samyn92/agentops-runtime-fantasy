@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -275,10 +276,18 @@ func (ec *EngramClient) SessionID() string {
 
 // Init creates a session in Engram for this runtime lifecycle.
 // Called once at daemon startup.
-func (ec *EngramClient) Init() error {
+func (ec *EngramClient) Init(ctx context.Context) error {
 	if ec == nil {
 		return nil
 	}
+
+	ctx, span := tracer.Start(ctx, "memory.init_session")
+	defer span.End()
+	span.SetAttributes(
+		attrMemoryOp.String("init_session"),
+		attrMemoryProject.String(ec.project),
+		attrMemorySessionID.String(ec.sessionID),
+	)
 
 	body := map[string]string{
 		"id":      ec.sessionID,
@@ -287,6 +296,7 @@ func (ec *EngramClient) Init() error {
 
 	_, err := ec.post("/sessions", body)
 	if err != nil {
+		recordError(span, err)
 		return fmt.Errorf("memory init session: %w", err)
 	}
 
@@ -308,6 +318,7 @@ func (ec *EngramClient) FetchContext(ctx context.Context, limit int, query strin
 	span.SetAttributes(
 		attrMemoryOp.String("fetch_context"),
 		attrMemoryProject.String(ec.project),
+		attrMemoryLimit.Int(limit),
 	)
 
 	params := url.Values{
@@ -346,6 +357,7 @@ func (ec *EngramClient) FetchContext(ctx context.Context, limit int, query strin
 
 	if err := json.Unmarshal(resp, &contextResp); err != nil {
 		slog.Warn("memory context parse failed", "error", err)
+		recordError(span, err)
 		return ""
 	}
 
@@ -383,9 +395,31 @@ func (ec *EngramClient) FetchContext(ctx context.Context, limit int, query strin
 	}
 
 	if !hasContent {
+		span.SetAttributes(
+			attrMemorySessionsCount.Int(len(contextResp.RecentSessions)),
+			attrMemoryObservationsCount.Int(len(contextResp.RecentObservations)),
+			attrMemoryHasContent.Bool(false),
+			attrMemoryContextLength.Int(0),
+		)
 		return ""
 	}
-	return buf.String()
+
+	result := buf.String()
+
+	// Record response details on span for trace debuggability.
+	preview := result
+	if len(preview) > 500 {
+		preview = preview[:500] + "..."
+	}
+	span.SetAttributes(
+		attrMemorySessionsCount.Int(len(contextResp.RecentSessions)),
+		attrMemoryObservationsCount.Int(len(contextResp.RecentObservations)),
+		attrMemoryHasContent.Bool(true),
+		attrMemoryContextLength.Int(len(result)),
+		attrMemoryContextPreview.String(preview),
+	)
+
+	return result
 }
 
 // SaveObservation explicitly saves an observation (long-term memory).
@@ -400,7 +434,14 @@ func (ec *EngramClient) SaveObservation(ctx context.Context, obsType, title, con
 	span.SetAttributes(
 		attrMemoryOp.String("save_observation"),
 		attrMemoryProject.String(ec.project),
+		attrMemorySessionID.String(ec.sessionID),
+		attrMemoryObsType.String(obsType),
+		attrMemoryObsTitle.String(title),
+		attrMemoryContentLength.Int(len(content)),
 	)
+	if len(tags) > 0 {
+		span.SetAttributes(attrMemoryTags.String(strings.Join(tags, ",")))
+	}
 
 	body := map[string]any{
 		"session_id": ec.sessionID,
@@ -426,10 +467,19 @@ func (ec *EngramClient) SaveObservation(ctx context.Context, obsType, title, con
 // EndSession ends the memory session with an optional conversation transcript.
 // Engram is responsible for summarization — the runtime sends raw messages.
 // Called on daemon shutdown and task completion.
-func (ec *EngramClient) EndSession(messages []EngramSessionMessage) {
+func (ec *EngramClient) EndSession(ctx context.Context, messages []EngramSessionMessage) {
 	if ec == nil {
 		return
 	}
+
+	_, span := tracer.Start(ctx, "memory.end_session")
+	defer span.End()
+	span.SetAttributes(
+		attrMemoryOp.String("end_session"),
+		attrMemoryProject.String(ec.project),
+		attrMemorySessionID.String(ec.sessionID),
+		attrMemoryMessageCount.Int(len(messages)),
+	)
 
 	body := map[string]any{}
 	if len(messages) > 0 {
@@ -439,6 +489,7 @@ func (ec *EngramClient) EndSession(messages []EngramSessionMessage) {
 	_, err := ec.post("/sessions/"+ec.sessionID+"/end", body)
 	if err != nil {
 		slog.Warn("memory end session failed", "error", err)
+		recordError(span, err)
 	} else {
 		slog.Info("memory session ended", "session_id", ec.sessionID)
 	}
@@ -492,6 +543,9 @@ func (ec *EngramClient) Search(ctx context.Context, query string, limit int) ([]
 	span.SetAttributes(
 		attrMemoryOp.String("search"),
 		attrMemoryProject.String(ec.project),
+		attrMemorySessionID.String(ec.sessionID),
+		attrMemorySearchQuery.String(query),
+		attrMemoryLimit.Int(limit),
 	)
 
 	params := url.Values{
@@ -510,8 +564,11 @@ func (ec *EngramClient) Search(ctx context.Context, query string, limit int) ([]
 
 	var results []EngramSearchResult
 	if err := json.Unmarshal(resp, &results); err != nil {
+		recordError(span, err)
 		return nil, fmt.Errorf("memory search parse: %w", err)
 	}
+
+	span.SetAttributes(attrMemoryResultCount.Int(len(results)))
 	return results, nil
 }
 
