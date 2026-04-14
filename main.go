@@ -148,7 +148,7 @@ func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, in
 		tools = append(tools, newRunAgentToolStub(), newRunAgentsToolStub(), newGetAgentRunToolStub(), newListTaskAgentsToolStub())
 	} else {
 		delegationWatcher = NewDelegationWatcher(k8sClient)
-		tools = append(tools, newRunAgentTool(k8sClient, cfg.Resources), newRunAgentsTool(k8sClient, cfg.Resources, delegationWatcher, cfg.Delegation), newGetAgentRunTool(k8sClient), newListTaskAgentsTool(k8sClient))
+		tools = append(tools, newRunAgentTool(k8sClient, cfg.Resources, cfg.Delegation), newRunAgentsTool(k8sClient, cfg.Resources, delegationWatcher, cfg.Delegation), newGetAgentRunTool(k8sClient), newListTaskAgentsTool(k8sClient, cfg.Delegation))
 	}
 
 	// Add any extra tools (e.g. memory tools from Engram)
@@ -1923,8 +1923,18 @@ func buildRunAgentDescription(resources []ResourceEntry) string {
 	return base
 }
 
-func newRunAgentTool(k8s *K8sClient, resources []ResourceEntry) fantasy.AgentTool {
+func newRunAgentTool(k8s *K8sClient, resources []ResourceEntry, delegation *DelegationConfig) fantasy.AgentTool {
 	desc := buildRunAgentDescription(resources)
+
+	// Build team set for O(1) lookup
+	var teamSet map[string]struct{}
+	if delegation != nil && len(delegation.Team) > 0 {
+		teamSet = make(map[string]struct{}, len(delegation.Team))
+		for _, name := range delegation.Team {
+			teamSet[name] = struct{}{}
+		}
+	}
+
 	return fantasy.NewAgentTool("run_agent", desc,
 		func(ctx context.Context, input runAgentInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if input.Agent == "" || input.Prompt == "" {
@@ -1948,6 +1958,14 @@ func newRunAgentTool(k8s *K8sClient, resources []ResourceEntry) fantasy.AgentToo
 					"Cannot run_agent on yourself (%q). Use run_agent to trigger a different agent (typically a task-mode agent).", agentName)), nil
 			}
 
+			// Check team membership (the team list IS the access control)
+			if teamSet != nil {
+				if _, ok := teamSet[input.Agent]; !ok {
+					return fantasy.NewTextErrorResponse(fmt.Sprintf(
+						"Agent %q is not in your team. Your team: %v", input.Agent, delegation.Team)), nil
+				}
+			}
+
 			// Validate target agent exists before creating the AgentRun CR
 			agentInfo, err := k8s.GetAgent(ctx, input.Agent)
 			if err != nil {
@@ -1969,14 +1987,6 @@ func newRunAgentTool(k8s *K8sClient, resources []ResourceEntry) fantasy.AgentToo
 				}
 				return fantasy.NewTextErrorResponse(fmt.Sprintf(
 					"Agent %q not found. Available agents:%s", input.Agent, agentList)), nil
-			}
-
-			// Check delegation constraints: is this agent allowed to delegate to the target?
-			targetScope, targetCallers, discErr := k8s.GetAgentDiscovery(ctx, input.Agent)
-			if discErr == nil && !isAgentVisible(targetScope, targetCallers, agentName) {
-				return fantasy.NewTextErrorResponse(fmt.Sprintf(
-					"Agent %q is not available for delegation (scope: %s). You are not in its allowedCallers list.",
-					input.Agent, targetScope)), nil
 			}
 
 			// Warn if targeting a daemon (will use HTTP prompt, not spawn a Job)
@@ -2116,12 +2126,17 @@ type listTaskAgentsInput struct {
 	IncludeDaemons bool `json:"include_daemons,omitempty" description:"Include daemon agents in the list (default: only task agents)"`
 }
 
-func newListTaskAgentsTool(k8s *K8sClient) fantasy.AgentTool {
+func newListTaskAgentsTool(k8s *K8sClient, delegation *DelegationConfig) fantasy.AgentTool {
+	// Build team filter from delegation config
+	var teamFilter []string
+	if delegation != nil && len(delegation.Team) > 0 {
+		teamFilter = delegation.Team
+	}
+
 	return fantasy.NewAgentTool("list_task_agents",
-		"List available agents with their capabilities and bound resources. "+
-			"Returns each agent's name, mode, phase, model, description (or system prompt summary), tags, and bound resources "+
+		"List available agents in your team with their capabilities and bound resources. "+
+			"Returns each agent's name, mode, phase, model, system prompt summary, and bound resources "+
 			"(git repos with owner/project info and default branches). "+
-			"Agents with scope=hidden are excluded. Agents with scope=explicit are only shown if you are in their allowedCallers. "+
 			"Use this to decide which agent to delegate to and which git resources are available for run_agent.",
 		func(ctx context.Context, input listTaskAgentsInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			selfName := os.Getenv("AGENT_NAME")
@@ -2129,7 +2144,7 @@ func newListTaskAgentsTool(k8s *K8sClient) fantasy.AgentTool {
 				selfName = "unknown"
 			}
 
-			agents, err := k8s.ListAgentDetails(ctx, selfName)
+			agents, err := k8s.ListAgentDetails(ctx, teamFilter)
 			if err != nil {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("Failed to list agents: %s", err)), nil
 			}
@@ -2156,16 +2171,9 @@ func newListTaskAgentsTool(k8s *K8sClient) fantasy.AgentTool {
 				}
 				text.WriteString("\n")
 
-				// Prefer discovery.description over truncated system prompt
-				if a.Description != "" {
-					text.WriteString(fmt.Sprintf("  Description: %s\n", a.Description))
-				} else if a.SystemPrompt != "" {
+				// Show truncated system prompt as purpose
+				if a.SystemPrompt != "" {
 					text.WriteString(fmt.Sprintf("  Purpose: %s\n", a.SystemPrompt))
-				}
-
-				// Show tags if present
-				if len(a.Tags) > 0 {
-					text.WriteString(fmt.Sprintf("  Tags: %s\n", strings.Join(a.Tags, ", ")))
 				}
 
 				if len(a.ResourceBindings) > 0 {
@@ -2198,7 +2206,7 @@ func newListTaskAgentsTool(k8s *K8sClient) fantasy.AgentTool {
 			}
 
 			if count == 0 {
-				return fantasy.NewTextResponse("No other agents found in this namespace."), nil
+				return fantasy.NewTextResponse("No other agents found in your team."), nil
 			}
 
 			text.WriteString(fmt.Sprintf("\n(%d agents listed. Use run_agent to delegate tasks.)", count))

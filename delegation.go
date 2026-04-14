@@ -60,6 +60,15 @@ func newRunAgentsTool(k8s *K8sClient, resources []ResourceEntry, watcher *Delega
 		maxFanOut = delegation.MaxFanOut
 	}
 
+	// Build team set for O(1) lookup
+	var teamSet map[string]struct{}
+	if delegation != nil && len(delegation.Team) > 0 {
+		teamSet = make(map[string]struct{}, len(delegation.Team))
+		for _, name := range delegation.Team {
+			teamSet[name] = struct{}{}
+		}
+	}
+
 	return fantasy.NewAgentTool("run_agents", desc,
 		func(ctx context.Context, input runAgentsInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if len(input.Delegations) == 0 {
@@ -106,7 +115,14 @@ func newRunAgentsTool(k8s *K8sClient, resources []ResourceEntry, watcher *Delega
 					}
 				}
 
-				// Check agent exists and is visible
+				// Check team membership (the team list IS the access control)
+				if teamSet != nil {
+					if _, ok := teamSet[d.Agent]; !ok {
+						return fantasy.NewTextErrorResponse(fmt.Sprintf("delegation[%d]: agent %q is not in your team. Your team: %v", i, d.Agent, delegation.Team)), nil
+					}
+				}
+
+				// Check agent exists
 				agentInfo, err := k8s.GetAgent(ctx, d.Agent)
 				if err != nil {
 					available, listErr := k8s.ListAgents(ctx)
@@ -120,12 +136,6 @@ func newRunAgentsTool(k8s *K8sClient, resources []ResourceEntry, watcher *Delega
 						}
 					}
 					return fantasy.NewTextErrorResponse(fmt.Sprintf("delegation[%d]: agent %q not found. Available agents:%s", i, d.Agent, agentList)), nil
-				}
-
-				// Check delegation constraints
-				targetScope, targetCallers, discErr := k8s.GetAgentDiscovery(ctx, d.Agent)
-				if discErr == nil && !isAgentVisible(targetScope, targetCallers, agentName) {
-					return fantasy.NewTextErrorResponse(fmt.Sprintf("delegation[%d]: agent %q is not available for delegation (scope: %s)", i, d.Agent, targetScope)), nil
 				}
 
 				// Check daemon readiness

@@ -86,17 +86,13 @@ type AgentInfo struct {
 	Phase string `json:"phase"`
 }
 
-// AgentDetail holds rich info about an Agent CR including resource bindings and discovery.
+// AgentDetail holds rich info about an Agent CR including resource bindings.
 type AgentDetail struct {
 	Name             string               `json:"name"`
 	Mode             string               `json:"mode"`
 	Phase            string               `json:"phase"`
 	Model            string               `json:"model,omitempty"`
 	SystemPrompt     string               `json:"systemPrompt,omitempty"`
-	Description      string               `json:"description,omitempty"`    // from discovery.description
-	Tags             []string             `json:"tags,omitempty"`           // from discovery.tags
-	Scope            string               `json:"scope,omitempty"`          // from discovery.scope
-	AllowedCallers   []string             `json:"allowedCallers,omitempty"` // from discovery.allowedCallers
 	ResourceBindings []AgentResourceBrief `json:"resourceBindings,omitempty"`
 }
 
@@ -144,11 +140,11 @@ func (k *K8sClient) ListAgents(ctx context.Context) ([]AgentInfo, error) {
 	return agents, nil
 }
 
-// ListAgentDetails returns enriched Agent info including resource bindings and discovery.
-// It fetches all Agent CRs, reads their resourceBindings and discovery fields, and
-// resolves each binding name to the actual AgentResource CR for kind/display/config info.
-// callerName is the name of the calling agent — used to filter by scope/allowedCallers.
-func (k *K8sClient) ListAgentDetails(ctx context.Context, callerName string) ([]AgentDetail, error) {
+// ListAgentDetails returns enriched Agent info including resource bindings.
+// It fetches all Agent CRs, reads their resourceBindings, and resolves each
+// binding name to the actual AgentResource CR for kind/display/config info.
+// teamFilter, if non-nil, restricts results to only agents in the team list.
+func (k *K8sClient) ListAgentDetails(ctx context.Context, teamFilter []string) ([]AgentDetail, error) {
 	list, err := k.client.Resource(agentGVR).Namespace(k.namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("list agents: %w", err)
@@ -161,46 +157,42 @@ func (k *K8sClient) ListAgentDetails(ctx context.Context, callerName string) ([]
 		resourceMap = map[string]*unstructured.Unstructured{}
 	}
 
+	// Build team set for O(1) lookup
+	var teamSet map[string]struct{}
+	if teamFilter != nil {
+		teamSet = make(map[string]struct{}, len(teamFilter))
+		for _, name := range teamFilter {
+			teamSet[name] = struct{}{}
+		}
+	}
+
 	agents := make([]AgentDetail, 0, len(list.Items))
 	for _, item := range list.Items {
 		name := item.GetName()
+
+		// Apply team filter if set
+		if teamSet != nil {
+			if _, ok := teamSet[name]; !ok {
+				continue
+			}
+		}
+
 		mode, _, _ := unstructured.NestedString(item.Object, "spec", "mode")
 		phase, _, _ := unstructured.NestedString(item.Object, "status", "phase")
 		model, _, _ := unstructured.NestedString(item.Object, "spec", "model")
 		systemPrompt, _, _ := unstructured.NestedString(item.Object, "spec", "systemPrompt")
 
-		// Read discovery fields
-		description, _, _ := unstructured.NestedString(item.Object, "spec", "discovery", "description")
-		scope, _, _ := unstructured.NestedString(item.Object, "spec", "discovery", "scope")
-		tagsRaw, _, _ := unstructured.NestedStringSlice(item.Object, "spec", "discovery", "tags")
-		allowedCallersRaw, _, _ := unstructured.NestedStringSlice(item.Object, "spec", "discovery", "allowedCallers")
-
-		// Default scope to "namespace" if not set
-		if scope == "" {
-			scope = "namespace"
-		}
-
-		// Apply visibility filtering
-		if !isAgentVisible(scope, allowedCallersRaw, callerName) {
-			continue
-		}
-
-		// Truncate system prompt for display (first 200 chars) — only used as
-		// fallback when no discovery.description is set
+		// Truncate system prompt for display (first 200 chars)
 		if len(systemPrompt) > 200 {
 			systemPrompt = systemPrompt[:200] + "..."
 		}
 
 		detail := AgentDetail{
-			Name:           name,
-			Mode:           mode,
-			Phase:          phase,
-			Model:          model,
-			SystemPrompt:   systemPrompt,
-			Description:    description,
-			Tags:           tagsRaw,
-			Scope:          scope,
-			AllowedCallers: allowedCallersRaw,
+			Name:         name,
+			Mode:         mode,
+			Phase:        phase,
+			Model:        model,
+			SystemPrompt: systemPrompt,
 		}
 
 		// Resolve resource bindings
@@ -222,40 +214,6 @@ func (k *K8sClient) ListAgentDetails(ctx context.Context, callerName string) ([]
 		agents = append(agents, detail)
 	}
 	return agents, nil
-}
-
-// GetAgentDiscovery fetches a single Agent CR's discovery fields.
-// Used by run_agent to check delegation constraints before creating an AgentRun.
-func (k *K8sClient) GetAgentDiscovery(ctx context.Context, name string) (scope string, allowedCallers []string, err error) {
-	obj, err := k.client.Resource(agentGVR).Namespace(k.namespace).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return "", nil, err
-	}
-
-	scope, _, _ = unstructured.NestedString(obj.Object, "spec", "discovery", "scope")
-	if scope == "" {
-		scope = "namespace"
-	}
-	allowedCallers, _, _ = unstructured.NestedStringSlice(obj.Object, "spec", "discovery", "allowedCallers")
-	return scope, allowedCallers, nil
-}
-
-// isAgentVisible checks if the target agent is visible to the caller based on
-// discovery scope and allowedCallers.
-func isAgentVisible(scope string, allowedCallers []string, callerName string) bool {
-	switch scope {
-	case "hidden":
-		return false
-	case "explicit":
-		for _, c := range allowedCallers {
-			if c == callerName {
-				return true
-			}
-		}
-		return false
-	default: // "namespace" or unset
-		return true
-	}
 }
 
 // listAgentResourceMap fetches all AgentResource CRs and indexes by name.
