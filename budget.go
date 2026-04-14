@@ -46,6 +46,17 @@ var modelContextWindows = map[string]int64{
 	// Google
 	"gemini-2.5-pro":   1_048_576,
 	"gemini-2.5-flash": 1_048_576,
+
+	// Moonshot / Kimi
+	"kimi-k2.5":              256_000,
+	"kimi-k2-0905-preview":   256_000,
+	"kimi-k2-0711-preview":   128_000,
+	"kimi-k2-turbo-preview":  256_000,
+	"kimi-k2-thinking":       256_000,
+	"kimi-k2-thinking-turbo": 256_000,
+	"moonshot-v1-8k":         8_000,
+	"moonshot-v1-32k":        32_000,
+	"moonshot-v1-128k":       128_000,
 }
 
 // DefaultContextWindow is used when the model is not in the lookup table.

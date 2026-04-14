@@ -51,15 +51,22 @@ const (
 	maxDelegationTimeout     = 4 * time.Hour
 )
 
-func newRunAgentsTool(k8s *K8sClient, resources []ResourceEntry, watcher *DelegationWatcher) fantasy.AgentTool {
+func newRunAgentsTool(k8s *K8sClient, resources []ResourceEntry, watcher *DelegationWatcher, delegation *DelegationConfig) fantasy.AgentTool {
 	desc := buildRunAgentsDescription(resources)
+
+	// Determine maxFanOut: use delegation config if set, otherwise hard max of 10.
+	maxFanOut := 10
+	if delegation != nil && delegation.MaxFanOut > 0 && delegation.MaxFanOut <= 10 {
+		maxFanOut = delegation.MaxFanOut
+	}
+
 	return fantasy.NewAgentTool("run_agents", desc,
 		func(ctx context.Context, input runAgentsInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if len(input.Delegations) == 0 {
 				return fantasy.NewTextErrorResponse("delegations array is required and must not be empty"), nil
 			}
-			if len(input.Delegations) > 10 {
-				return fantasy.NewTextErrorResponse("max 10 delegations per fan-out (prevent resource exhaustion)"), nil
+			if len(input.Delegations) > maxFanOut {
+				return fantasy.NewTextErrorResponse(fmt.Sprintf("max %d delegations per fan-out (configured via spec.delegation.maxFanOut)", maxFanOut)), nil
 			}
 
 			// Parse timeout

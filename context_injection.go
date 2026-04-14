@@ -35,9 +35,10 @@ import (
 // system message via PrepareStep. Thread-safe — set by prompt handlers,
 // read by PrepareStep callbacks which may run on different goroutines.
 type contextInjector struct {
-	mu              sync.RWMutex
-	memoryContext   string // formatted <memory:sessions> + <memory:context> from engram
-	resourceContext string // formatted resource context from console selections
+	mu               sync.RWMutex
+	memoryContext    string // formatted <memory:sessions> + <memory:context> from engram
+	resourceContext  string // formatted resource context from console selections
+	platformProtocol string // stable platform protocol (identity + delegation + memory instructions)
 }
 
 // Set stores the per-turn context. Called once per turn before the LLM call.
@@ -48,34 +49,46 @@ func (ci *contextInjector) Set(memoryCtx, resourceCtx string) {
 	ci.resourceContext = resourceCtx
 }
 
+// SetPlatformProtocol stores the platform protocol. Called once at startup.
+// This is stable across turns and gets its own cached system message part.
+func (ci *contextInjector) SetPlatformProtocol(protocol string) {
+	ci.mu.Lock()
+	defer ci.mu.Unlock()
+	ci.platformProtocol = protocol
+}
+
 // Clear resets the per-turn context. Called after each turn completes.
 func (ci *contextInjector) Clear() {
 	ci.mu.Lock()
 	defer ci.mu.Unlock()
 	ci.memoryContext = ""
 	ci.resourceContext = ""
+	// NOTE: platformProtocol is NOT cleared — it's stable across turns.
 }
 
 // get returns the current per-turn context. Called by PrepareStep on each step.
-func (ci *contextInjector) get() (memoryCtx, resourceCtx string) {
+func (ci *contextInjector) get() (platformProtocol, memoryCtx, resourceCtx string) {
 	ci.mu.RLock()
 	defer ci.mu.RUnlock()
-	return ci.memoryContext, ci.resourceContext
+	return ci.platformProtocol, ci.memoryContext, ci.resourceContext
 }
 
 // prepareStepWithContextInjection returns a PrepareStepFunction that:
-//  1. Injects memory context and resource context as additional TextParts in the
-//     system message (Messages[0]).
+//  1. Injects platform protocol, memory context, and resource context as
+//     additional TextParts in the system message (Messages[0]).
 //  2. Applies Anthropic prompt caching on stable parts.
 //
-// The base system prompt (TextPart 0) gets cached — it's stable across turns.
-// Memory context and resource context change per turn so they're not cached.
-// The conversation history boundary gets its own cache breakpoint.
+// System message structure:
+//
+//	Part 0a: platform protocol (identity + delegation + memory instructions) [cached]
+//	Part 0b: user's system prompt (from spec.systemPrompt) [cached]
+//	Part 1:  memory context (per-turn, from engram) [uncached]
+//	Part 2:  resource context (per-turn, from console) [uncached]
 //
 // Cache breakpoint budget (Anthropic allows 4):
 //
 //	#1 — tool definitions (applied in applyToolCaching)
-//	#2 — base system prompt TextPart (stable, high reuse)
+//	#2 — last stable system message part (platform protocol or user prompt)
 //	#3 — conversation history boundary (second-to-last message)
 //	#4 — available for future use
 func prepareStepWithContextInjection(injector *contextInjector, isAnthropic bool) fantasy.PrepareStepFunction {
@@ -88,38 +101,46 @@ func prepareStepWithContextInjection(injector *contextInjector, isAnthropic bool
 			return ctx, result, nil
 		}
 
-		// ── Step 1: Inject memory + resource context into system message ──
+		// ── Step 1: Inject platform protocol + memory + resource context into system message ──
 
-		memoryCtx, resourceCtx := injector.get()
-		hasInjection := memoryCtx != "" || resourceCtx != ""
+		platformProtocol, memoryCtx, resourceCtx := injector.get()
+		hasInjection := platformProtocol != "" || memoryCtx != "" || resourceCtx != ""
 
 		if hasInjection && len(result.Messages) > 0 && result.Messages[0].Role == fantasy.MessageRoleSystem {
 			// Extract the base system prompt text from the existing system message.
-			// It should be the first (and currently only) TextPart.
-			var basePrompt string
+			// It should be the first (and currently only) TextPart — the user's systemPrompt.
+			var userPrompt string
 			if len(result.Messages[0].Content) > 0 {
 				if tp, ok := fantasy.AsMessagePart[fantasy.TextPart](result.Messages[0].Content[0]); ok {
-					basePrompt = tp.Text
+					userPrompt = tp.Text
 				}
 			}
 
 			// Build multi-part system message:
-			//   Part 0: base system prompt (stable — cached on Anthropic)
-			//   Part 1: memory context (per-turn — not cached)
-			//   Part 2: resource context (per-turn — not cached)
-			parts := make([]fantasy.MessagePart, 0, 3)
+			//   Part 0a: platform protocol (stable — cached on Anthropic)
+			//   Part 0b: user system prompt (stable — cached on Anthropic)
+			//   Part 1:  memory context (per-turn — not cached)
+			//   Part 2:  resource context (per-turn — not cached)
+			parts := make([]fantasy.MessagePart, 0, 4)
 
-			// Part 0: base system prompt
-			basePart := fantasy.TextPart{Text: basePrompt}
+			// Part 0a: platform protocol (identity + delegation + memory instructions)
+			if platformProtocol != "" {
+				platformPart := fantasy.TextPart{Text: platformProtocol}
+				parts = append(parts, platformPart)
+				slog.Debug("platform protocol injected into system message", "length", len(platformProtocol))
+			}
+
+			// Part 0b: user's system prompt (verbatim from CRD spec.systemPrompt)
+			// This gets the Anthropic cache breakpoint since it's the last stable part.
+			userPart := fantasy.TextPart{Text: userPrompt}
 			if isAnthropic {
-				// Cache the base prompt — it's identical across turns
-				basePart.ProviderOptions = fantasy.ProviderOptions{
+				userPart.ProviderOptions = fantasy.ProviderOptions{
 					anthropic.Name: &anthropic.ProviderCacheControlOptions{
 						CacheControl: anthropic.CacheControl{Type: "ephemeral"},
 					},
 				}
 			}
-			parts = append(parts, basePart)
+			parts = append(parts, userPart)
 
 			// Part 1: memory context (sessions + observations)
 			if memoryCtx != "" {
@@ -145,7 +166,7 @@ func prepareStepWithContextInjection(injector *contextInjector, isAnthropic bool
 		if isAnthropic {
 			cacheOpts := anthropicCacheOptions()
 
-			// If we didn't inject context (no memory/resource), still cache the
+			// If we didn't inject context (no platform/memory/resource), still cache the
 			// system message at the message level (same as before).
 			if !hasInjection {
 				lastSystemIdx := -1

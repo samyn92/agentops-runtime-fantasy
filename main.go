@@ -148,7 +148,7 @@ func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, in
 		tools = append(tools, newRunAgentToolStub(), newRunAgentsToolStub(), newGetAgentRunToolStub(), newListTaskAgentsToolStub())
 	} else {
 		delegationWatcher = NewDelegationWatcher(k8sClient)
-		tools = append(tools, newRunAgentTool(k8sClient, cfg.Resources), newRunAgentsTool(k8sClient, cfg.Resources, delegationWatcher), newGetAgentRunTool(k8sClient), newListTaskAgentsTool(k8sClient))
+		tools = append(tools, newRunAgentTool(k8sClient, cfg.Resources), newRunAgentsTool(k8sClient, cfg.Resources, delegationWatcher, cfg.Delegation), newGetAgentRunTool(k8sClient), newListTaskAgentsTool(k8sClient))
 	}
 
 	// Add any extra tools (e.g. memory tools from Engram)
@@ -464,6 +464,11 @@ func runDaemon() error {
 	// Create context injector — holds per-turn memory/resource context for PrepareStep
 	ctxInjector := &contextInjector{}
 
+	// Set platform protocol — stable across turns, injected as a separate system message part
+	if cfg.PlatformProtocol != "" {
+		ctxInjector.SetPlatformProtocol(cfg.PlatformProtocol)
+	}
+
 	// Build agent bundle (includes memory tools if engram is available)
 	bundle, err := buildAgentBundle(ctx, cfg, engram, ctxInjector, buildMemoryTools(engram)...)
 	if err != nil {
@@ -483,7 +488,9 @@ func runDaemon() error {
 		budgetFrac = *cfg.BudgetFraction
 	}
 	ctxBudget := NewContextBudget(cfg.PrimaryModel, budgetFrac)
-	ctxBudget.UpdateFixed(cfg.SystemPrompt, bundle.toolCount)
+	// Include both platform protocol and user prompt in fixed budget calculation
+	fixedPrompt := cfg.PlatformProtocol + "\n" + cfg.SystemPrompt
+	ctxBudget.UpdateFixed(fixedPrompt, bundle.toolCount)
 
 	srv := &daemonServer{
 		bundle:      bundle,
@@ -1755,6 +1762,11 @@ func runTask() error {
 
 	// Create context injector for task agent
 	taskInjector := &contextInjector{}
+
+	// Set platform protocol — stable, injected as separate system message part
+	if cfg.PlatformProtocol != "" {
+		taskInjector.SetPlatformProtocol(cfg.PlatformProtocol)
+	}
 
 	// Fetch memory context (relevance-ranked by task prompt) and set on injector
 	if engram != nil {
