@@ -810,3 +810,84 @@ func delegationSpanOptions(traceparent, parentAgent, runName string) []trace.Spa
 
 	return opts
 }
+
+// createRetrospectiveStepSpans creates agent.step child spans with proper timing
+// for non-streaming code paths (daemon handlePrompt, task runner runTask).
+//
+// Since the Fantasy SDK provides no per-step timing data, we distribute the
+// total wall-clock duration proportionally across steps based on token count
+// (input + output). This is a reasonable proxy because LLM inference time
+// correlates strongly with tokens processed/generated.
+//
+// The streaming path (OnStepStart/OnStepFinish) doesn't need this — it captures
+// real wall-clock timestamps via the callbacks.
+func createRetrospectiveStepSpans(ctx context.Context, steps []fantasy.StepResult, genStart, genEnd time.Time) {
+	if len(steps) == 0 {
+		return
+	}
+
+	totalElapsed := genEnd.Sub(genStart)
+
+	// Sum total tokens across all steps for proportional distribution.
+	var totalTokens int64
+	for _, step := range steps {
+		totalTokens += step.Usage.InputTokens + step.Usage.OutputTokens
+	}
+
+	// If no token data (shouldn't happen), distribute evenly.
+	if totalTokens == 0 {
+		perStep := totalElapsed / time.Duration(len(steps))
+		for i, step := range steps {
+			stepStart := genStart.Add(perStep * time.Duration(i))
+			stepEnd := stepStart.Add(perStep)
+			_, stepSpan := tracer.Start(ctx, "agent.step",
+				trace.WithTimestamp(stepStart),
+				trace.WithAttributes(
+					attrStepNumber.Int(i+1),
+					attrGenAIOperationName.String("agent_step"),
+					attrStepFinishReason.String(string(step.FinishReason)),
+					attrStepToolCalls.Int(len(step.Content.ToolCalls())),
+					attrGenAIInputTokens.Int64(step.Usage.InputTokens),
+					attrGenAIOutputTokens.Int64(step.Usage.OutputTokens),
+				),
+			)
+			if step.Usage.ReasoningTokens > 0 {
+				stepSpan.SetAttributes(attrGenAIReasoningTokens.Int64(step.Usage.ReasoningTokens))
+			}
+			stepSpan.End(trace.WithTimestamp(stepEnd))
+		}
+		return
+	}
+
+	// Distribute elapsed time proportionally by token count.
+	cursor := genStart
+	for i, step := range steps {
+		stepTokens := step.Usage.InputTokens + step.Usage.OutputTokens
+		fraction := float64(stepTokens) / float64(totalTokens)
+		stepDuration := time.Duration(fraction * float64(totalElapsed))
+
+		// Last step gets the remainder to avoid rounding drift.
+		stepEnd := cursor.Add(stepDuration)
+		if i == len(steps)-1 {
+			stepEnd = genEnd
+		}
+
+		_, stepSpan := tracer.Start(ctx, "agent.step",
+			trace.WithTimestamp(cursor),
+			trace.WithAttributes(
+				attrStepNumber.Int(i+1),
+				attrGenAIOperationName.String("agent_step"),
+				attrStepFinishReason.String(string(step.FinishReason)),
+				attrStepToolCalls.Int(len(step.Content.ToolCalls())),
+				attrGenAIInputTokens.Int64(step.Usage.InputTokens),
+				attrGenAIOutputTokens.Int64(step.Usage.OutputTokens),
+			),
+		)
+		if step.Usage.ReasoningTokens > 0 {
+			stepSpan.SetAttributes(attrGenAIReasoningTokens.Int64(step.Usage.ReasoningTokens))
+		}
+		stepSpan.End(trace.WithTimestamp(stepEnd))
+
+		cursor = stepEnd
+	}
+}

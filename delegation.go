@@ -352,6 +352,7 @@ type DelegationGroup struct {
 	Remaining int                   `json:"remaining"` // count of runs not yet terminal
 	Timeout   time.Time             `json:"timeout"`
 	CreatedAt time.Time             `json:"createdAt"`
+	Single    bool                  `json:"single,omitempty"` // true for run_agent (single delegation, not fan-out)
 	cancelFn  context.CancelFunc    // stops all watch goroutines + timeout timer
 }
 
@@ -402,13 +403,25 @@ func (dw *DelegationWatcher) Register(group *DelegationGroup) {
 		"timeout", group.Timeout.Format(time.RFC3339),
 	)
 
-	// Emit fan-out FEP event
-	dw.emitFEP("delegation.fan_out", map[string]any{
-		"groupId":  group.ID,
-		"count":    len(group.Runs),
-		"timeout":  group.Timeout.Format(time.RFC3339),
-		"runNames": runNamesFromGroup(group),
-	})
+	// Emit FEP event
+	if group.Single {
+		// Single delegation — emit a lighter event
+		for runName := range group.Runs {
+			dw.emitFEP("delegation.single", map[string]any{
+				"groupId": group.ID,
+				"runName": runName,
+				"timeout": group.Timeout.Format(time.RFC3339),
+			})
+			break
+		}
+	} else {
+		dw.emitFEP("delegation.fan_out", map[string]any{
+			"groupId":  group.ID,
+			"count":    len(group.Runs),
+			"timeout":  group.Timeout.Format(time.RFC3339),
+			"runNames": runNamesFromGroup(group),
+		})
+	}
 
 	// Start a watch goroutine for each run
 	for runName := range group.Runs {
@@ -672,10 +685,11 @@ func (dw *DelegationWatcher) triggerCallback(group *DelegationGroup) {
 		"elapsed", time.Since(group.CreatedAt).Round(time.Second),
 	)
 
-	// Emit all-completed FEP event
+	// Emit completion FEP event
 	succeeded, failed := countOutcomes(group)
 	dw.emitFEP("delegation.all_completed", map[string]any{
 		"groupId":       group.ID,
+		"single":        group.Single,
 		"succeeded":     succeeded,
 		"failed":        failed,
 		"totalDuration": time.Since(group.CreatedAt).Round(time.Second).String(),
@@ -810,6 +824,54 @@ func isTerminalPhase(phase string) bool {
 func buildCallbackPrompt(group *DelegationGroup, timedOut bool) string {
 	var b strings.Builder
 
+	if group.Single {
+		// Single delegation (run_agent) — concise callback
+		for runName, result := range group.Runs {
+			if timedOut {
+				b.WriteString(fmt.Sprintf("[DELEGATION RESULT] Agent run %s TIMED OUT after %s.\n\n",
+					runName, time.Since(group.CreatedAt).Round(time.Second)))
+				if result != nil {
+					b.WriteString(fmt.Sprintf("Partial result — %s (%s)\n", result.Phase, result.AgentName))
+				} else {
+					b.WriteString("The agent did not complete within the timeout. You may want to check on it with get_agent_run.\n")
+				}
+			} else {
+				b.WriteString(fmt.Sprintf("[DELEGATION RESULT] Agent run %s completed (%s):\n\n",
+					runName, time.Since(group.CreatedAt).Round(time.Second)))
+				if result != nil {
+					b.WriteString(fmt.Sprintf("  Agent: %s — %s", result.AgentName, result.Phase))
+					if result.Duration > 0 {
+						b.WriteString(fmt.Sprintf(" (%s)", result.Duration.Round(time.Second)))
+					}
+					b.WriteString("\n")
+					if result.PullRequestURL != "" {
+						b.WriteString(fmt.Sprintf("  PR: %s\n", result.PullRequestURL))
+					}
+					if result.Branch != "" {
+						b.WriteString(fmt.Sprintf("  Branch: %s (commits: %d)\n", result.Branch, result.Commits))
+					}
+					if result.ToolCalls > 0 {
+						b.WriteString(fmt.Sprintf("  Tool calls: %d, Model: %s\n", result.ToolCalls, result.Model))
+					}
+					if result.Output != "" {
+						output := result.Output
+						if len(output) > 2000 {
+							output = output[:2000] + "\n  ... (truncated)"
+						}
+						b.WriteString(fmt.Sprintf("  Output:\n  %s\n", strings.ReplaceAll(output, "\n", "\n  ")))
+					}
+					if result.FailureReason != "" {
+						b.WriteString(fmt.Sprintf("  Failure: %s\n", result.FailureReason))
+					}
+				}
+			}
+			break // Single delegation — only one run
+		}
+		b.WriteString("\nPlease review the result and respond to the user.\n")
+		return b.String()
+	}
+
+	// Fan-out delegation (run_agents) — multi-result callback
 	if timedOut {
 		b.WriteString(fmt.Sprintf("[DELEGATION RESULTS] Fan-out group %s TIMED OUT (%s):\n\n",
 			group.ID, time.Since(group.CreatedAt).Round(time.Second)))

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"charm.land/fantasy"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -150,7 +151,7 @@ func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, in
 		tools = append(tools, newRunAgentToolStub(), newRunAgentsToolStub(), newGetAgentRunToolStub(), newListTaskAgentsToolStub())
 	} else {
 		delegationWatcher = NewDelegationWatcher(k8sClient)
-		tools = append(tools, newRunAgentTool(k8sClient, cfg.Resources, cfg.Delegation), newRunAgentsTool(k8sClient, cfg.Resources, delegationWatcher, cfg.Delegation), newGetAgentRunTool(k8sClient), newListTaskAgentsTool(k8sClient, cfg.Delegation))
+		tools = append(tools, newRunAgentTool(k8sClient, cfg.Resources, delegationWatcher, cfg.Delegation), newRunAgentsTool(k8sClient, cfg.Resources, delegationWatcher, cfg.Delegation), newGetAgentRunTool(k8sClient), newListTaskAgentsTool(k8sClient, cfg.Delegation))
 	}
 
 	// Add any extra tools (e.g. memory tools from Engram)
@@ -826,10 +827,12 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 		s.budget.UpdatePerTurn(memoryCtx, resourceCtx, req.Prompt, messages)
 	}
 
+	genStart := time.Now()
 	result, usedModel, err := generateWithFallback(ctx, s.cfg, s.bundle, fantasy.AgentCall{
 		Prompt:   req.Prompt,
 		Messages: messages,
 	})
+	genEnd := time.Now()
 	if err != nil {
 		recordError(promptSpan, err)
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -841,23 +844,10 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	// Record the assistant response as a content event
 	recordCompletionEvent(promptSpan, output)
 
-	// Create retrospective agent.step spans for each step (non-streaming path).
+	// Create retrospective agent.step spans with proportional timing.
 	// In streaming mode, OnStepStart/OnStepFinish create these in real-time;
 	// here we reconstruct them after the fact so traces show the same structure.
-	for i, step := range result.Steps {
-		_, stepSpan := tracer.Start(ctx, "agent.step", trace.WithAttributes(
-			attrStepNumber.Int(i+1),
-			attrGenAIOperationName.String("agent_step"),
-			attrStepFinishReason.String(string(step.FinishReason)),
-			attrStepToolCalls.Int(len(step.Content.ToolCalls())),
-			attrGenAIInputTokens.Int64(step.Usage.InputTokens),
-			attrGenAIOutputTokens.Int64(step.Usage.OutputTokens),
-		))
-		if step.Usage.ReasoningTokens > 0 {
-			stepSpan.SetAttributes(attrGenAIReasoningTokens.Int64(step.Usage.ReasoningTokens))
-		}
-		stepSpan.End()
-	}
+	createRetrospectiveStepSpans(ctx, result.Steps, genStart, genEnd)
 
 	// Append to working memory
 	s.memory.Append(fantasy.NewUserMessage(req.Prompt))
@@ -1867,7 +1857,9 @@ func runTask() error {
 	}
 	defer shutdownMCPConnections(bundle.mcpConns)
 
+	genStart := time.Now()
 	agentResult, usedModel, err := generateWithFallback(ctx, cfg, bundle, fantasy.AgentCall{Prompt: prompt})
+	genEnd := time.Now()
 	if err != nil {
 		recordError(promptSpan, err)
 		promptSpan.End()
@@ -1882,21 +1874,8 @@ func runTask() error {
 	// Record the assistant response as a content event
 	recordCompletionEvent(promptSpan, output)
 
-	// Create retrospective agent.step spans for each step (non-streaming task path).
-	for i, step := range agentResult.Steps {
-		_, stepSpan := tracer.Start(ctx, "agent.step", trace.WithAttributes(
-			attrStepNumber.Int(i+1),
-			attrGenAIOperationName.String("agent_step"),
-			attrStepFinishReason.String(string(step.FinishReason)),
-			attrStepToolCalls.Int(len(step.Content.ToolCalls())),
-			attrGenAIInputTokens.Int64(step.Usage.InputTokens),
-			attrGenAIOutputTokens.Int64(step.Usage.OutputTokens),
-		))
-		if step.Usage.ReasoningTokens > 0 {
-			stepSpan.SetAttributes(attrGenAIReasoningTokens.Int64(step.Usage.ReasoningTokens))
-		}
-		stepSpan.End()
-	}
+	// Create retrospective agent.step spans with proportional timing.
+	createRetrospectiveStepSpans(ctx, agentResult.Steps, genStart, genEnd)
 
 	result := taskResult{
 		Output:  output,
@@ -1965,8 +1944,10 @@ type runAgentInput struct {
 // the cluster.
 func buildRunAgentDescription(resources []ResourceEntry) string {
 	base := "Delegate a task to another agent. Creates an AgentRun tracked by the operator. " +
-		"IMPORTANT: After calling run_agent, report back to the user that the task has been delegated " +
-		"and offer to check on it later. Do NOT automatically call get_agent_run — let the user decide when to check."
+		"Results are delivered automatically via callback when the agent completes.\n\n" +
+		"IMPORTANT: After calling run_agent, tell the user the task has been delegated. " +
+		"You will automatically receive the result when the agent finishes — do NOT poll with get_agent_run. " +
+		"The user can give you other tasks while waiting."
 
 	// Build git resource list
 	var gitResources []string
@@ -2017,7 +1998,7 @@ func buildRunAgentDescription(resources []ResourceEntry) string {
 	return base
 }
 
-func newRunAgentTool(k8s *K8sClient, resources []ResourceEntry, delegation *DelegationConfig) fantasy.AgentTool {
+func newRunAgentTool(k8s *K8sClient, resources []ResourceEntry, watcher *DelegationWatcher, delegation *DelegationConfig) fantasy.AgentTool {
 	desc := buildRunAgentDescription(resources)
 
 	// Build team set for O(1) lookup
@@ -2114,6 +2095,25 @@ func newRunAgentTool(k8s *K8sClient, resources []ResourceEntry, delegation *Dele
 				attribute.String("delegation.child_namespace", os.Getenv("AGENT_NAMESPACE")),
 			)
 
+			// Register with DelegationWatcher for automatic callback on completion.
+			// Uses the same infrastructure as run_agents fan-out — a group of 1.
+			if watcher != nil {
+				groupID := uuid.New().String()[:8]
+				group := &DelegationGroup{
+					ID:        groupID,
+					Runs:      map[string]*RunResult{run.Name: nil},
+					Remaining: 1,
+					Timeout:   time.Now().Add(defaultDelegationTimeout),
+					CreatedAt: time.Now(),
+					Single:    true,
+				}
+				watcher.Register(group)
+
+				currentSpan.SetAttributes(
+					attribute.String("delegation.group_id", groupID),
+				)
+			}
+
 			modeHint := ""
 			if agentInfo.Mode == "task" {
 				modeHint = " A task pod will be created to execute this."
@@ -2122,7 +2122,11 @@ func newRunAgentTool(k8s *K8sClient, resources []ResourceEntry, delegation *Dele
 				modeHint += fmt.Sprintf(" Git workspace: resource=%s branch=%s.", gitParams.ResourceRef, gitParams.Branch)
 			}
 
-			resp := fantasy.NewTextResponse(fmt.Sprintf("AgentRun %s created for agent %q.%s\n\nTell the user the task has been delegated. They can ask you to check on it anytime with get_agent_run name=%q.", run.Name, input.Agent, modeHint, run.Name))
+			resp := fantasy.NewTextResponse(fmt.Sprintf(
+				"AgentRun %s created for agent %q.%s\n\n"+
+					"Tell the user the task has been delegated. You will automatically receive the result when the agent completes — "+
+					"do NOT poll with get_agent_run. The user can give you other tasks while waiting.",
+				run.Name, input.Agent, modeHint))
 			resp = fantasy.WithResponseMetadata(resp, map[string]any{
 				"ui":        "agent-run",
 				"agent":     input.Agent,
