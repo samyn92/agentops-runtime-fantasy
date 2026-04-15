@@ -264,21 +264,3 @@ type ContextBudgetSnapshot struct {
 	CacheReadTokens     int64 `json:"cache_read_tokens"`
 	CacheWriteTokens    int64 `json:"cache_write_tokens"`
 }
-
-// UsedTokens returns the total estimated pre-flight token usage.
-func (s ContextBudgetSnapshot) UsedTokens() int64 {
-	return s.SystemPromptTokens + s.ToolTokens + s.MemoryContextTokens + s.ConversationTokens + s.PromptTokens
-}
-
-// UsagePercent returns the percentage of the context window used (0-100).
-func (s ContextBudgetSnapshot) UsagePercent() float64 {
-	if s.ContextWindow == 0 {
-		return 0
-	}
-	// Use actual tokens if available (more accurate), fall back to estimate
-	used := s.ActualInputTokens
-	if used == 0 {
-		used = s.UsedTokens()
-	}
-	return float64(used) / float64(s.ContextWindow) * 100
-}

@@ -585,10 +585,6 @@ type EngramSearchResult struct {
 
 // ── HTTP helpers ──
 
-func (ec *EngramClient) get(path string, params url.Values) ([]byte, error) {
-	return ec.getWithContext(context.Background(), path, params)
-}
-
 func (ec *EngramClient) getWithContext(ctx context.Context, path string, params url.Values) ([]byte, error) {
 	u := ec.baseURL + path
 	if len(params) > 0 {

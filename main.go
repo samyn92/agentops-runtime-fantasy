@@ -430,15 +430,10 @@ func runDaemon() error {
 	}
 
 	// Initialize memory system
-	contextLimit := 5
 	var engram *EngramClient
 	var preBuiltMemory *WorkingMemory
 
 	if cfg.Memory != nil {
-		if cfg.Memory.ContextLimit > 0 {
-			contextLimit = cfg.Memory.ContextLimit
-		}
-
 		project := cfg.Memory.Project
 		if project == "" {
 			project = agentName
@@ -471,8 +466,6 @@ func runDaemon() error {
 		// Stash wm for daemonServer construction below
 		preBuiltMemory = wm
 	}
-
-	_ = contextLimit // used in prompt handlers via cfg
 
 	// Create context injector — holds per-turn memory/resource context for PrepareStep
 	ctxInjector := &contextInjector{}
@@ -892,6 +885,287 @@ func (s *daemonServer) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(promptResponse{Output: output, Model: usedModel})
 }
 
+// ── Shared streaming callbacks builder ──
+
+// streamCallbacksConfig holds parameters for building the AgentStreamCall callbacks.
+type streamCallbacksConfig struct {
+	emit           *fepEmitter // can be nil — all FEP events silently dropped
+	prompt         string
+	messages       []fantasy.Message
+	ctx            context.Context // root context (parent for step spans)
+	sc             *sessionContext
+	onTTFT         func() // optional, called on first text delta (nil for internal prompts)
+	steerLogSuffix string // appended to "steer message injected" log message
+}
+
+// streamCallbacksResult holds state managed by the callbacks that callers need after streaming.
+type streamCallbacksResult struct {
+	stepCount int
+	mu        sync.Mutex
+}
+
+// FinalStepCount returns the final step count after streaming completes.
+func (r *streamCallbacksResult) FinalStepCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stepCount
+}
+
+// buildStreamCallbacks creates the shared AgentStreamCall with FEP event callbacks.
+// Handles nil emit gracefully (all FEP events silently dropped).
+// Returns the AgentStreamCall, a result struct for post-stream queries, and a cleanup
+// function that must be called after streamWithFallback to close any unclosed step spans.
+func (s *daemonServer) buildStreamCallbacks(cfg streamCallbacksConfig) (fantasy.AgentStreamCall, *streamCallbacksResult, func()) {
+	emit := cfg.emit
+	sc := cfg.sc
+
+	res := &streamCallbacksResult{}
+
+	// Track active step span for proper parent-child nesting.
+	// Tool calls within a step become children of the step span.
+	var activeStepCtx context.Context
+	var activeStepSpan trace.Span
+
+	// TTFT: wrap the optional callback in a sync.Once
+	var ttftOnce sync.Once
+
+	call := fantasy.AgentStreamCall{
+		Prompt:   cfg.prompt,
+		Messages: cfg.messages,
+
+		// ── Agent lifecycle ──
+
+		OnAgentStart: func() {
+			// Already emitted by caller before streamWithFallback
+		},
+
+		OnAgentFinish: func(ar *fantasy.AgentResult) error {
+			// Handled after streamWithFallback returns for cleaner flow
+			return nil
+		},
+
+		// ── Step lifecycle ──
+
+		OnStepStart: func(stepNumber int) error {
+			res.mu.Lock()
+			res.stepCount = stepNumber
+
+			// End previous step span if still open
+			if activeStepSpan != nil {
+				activeStepSpan.End()
+			}
+
+			// Start a new step span as child of the root prompt span
+			activeStepCtx, activeStepSpan = tracer.Start(cfg.ctx, "agent.step", trace.WithAttributes(
+				attrStepNumber.Int(stepNumber),
+				attrAgentName.String(s.agentName),
+			))
+			res.mu.Unlock()
+
+			if emit != nil {
+				emit.emitStepStart(stepNumber, s.agentName)
+			}
+
+			// Inject steer message if pending
+			if msg := sc.popSteerMessage(); msg != "" {
+				s.memory.Append(fantasy.NewUserMessage("[STEER] " + msg))
+				slog.Info("steer message injected"+cfg.steerLogSuffix, "message", truncate(msg, 100))
+			}
+
+			return nil
+		},
+
+		OnStepFinish: func(sr fantasy.StepResult) error {
+			res.mu.Lock()
+			currentStep := res.stepCount
+			stepSpan := activeStepSpan
+			res.mu.Unlock()
+
+			toolCallCount := len(sr.Content.ToolCalls())
+
+			// Set step span attributes and end it
+			if stepSpan != nil {
+				stepSpan.SetAttributes(
+					attrStepFinishReason.String(string(sr.FinishReason)),
+					attrStepToolCalls.Int(toolCallCount),
+					attrGenAIInputTokens.Int64(sr.Usage.InputTokens),
+					attrGenAIOutputTokens.Int64(sr.Usage.OutputTokens),
+				)
+				if sr.Usage.ReasoningTokens > 0 {
+					stepSpan.SetAttributes(attrGenAIReasoningTokens.Int64(sr.Usage.ReasoningTokens))
+				}
+				stepSpan.End()
+
+				res.mu.Lock()
+				activeStepSpan = nil
+				activeStepCtx = nil
+				res.mu.Unlock()
+			}
+
+			// Update budget with actual token usage from API response
+			s.budget.UpdateActual(sr.Usage)
+			if emit != nil {
+				stepBudgetSnap := s.budget.Snapshot()
+				emit.emitStepFinish(currentStep, s.agentName, sr.Usage, sr.FinishReason, toolCallCount, &stepBudgetSnap)
+			}
+			return nil
+		},
+
+		// ── Text streaming ──
+
+		OnTextStart: func(id string) error {
+			if emit != nil {
+				emit.emitTextStart(id)
+			}
+			return nil
+		},
+
+		OnTextDelta: func(id, text string) error {
+			// Record TTFT on the first text delta (only when onTTFT is set)
+			if cfg.onTTFT != nil {
+				ttftOnce.Do(cfg.onTTFT)
+			}
+			if emit != nil {
+				emit.emitTextDelta(id, text)
+			}
+			return nil
+		},
+
+		OnTextEnd: func(id string) error {
+			if emit != nil {
+				emit.emitTextEnd(id)
+			}
+			return nil
+		},
+
+		// ── Reasoning streaming ──
+
+		OnReasoningStart: func(id string, _ fantasy.ReasoningContent) error {
+			if emit != nil {
+				emit.emitReasoningStart(id)
+			}
+			return nil
+		},
+
+		OnReasoningDelta: func(id, text string) error {
+			if emit != nil {
+				emit.emitReasoningDelta(id, text)
+			}
+			return nil
+		},
+
+		OnReasoningEnd: func(id string, _ fantasy.ReasoningContent) error {
+			if emit != nil {
+				emit.emitReasoningEnd(id)
+			}
+			return nil
+		},
+
+		// ── Tool input streaming ──
+
+		OnToolInputStart: func(id, toolName string) error {
+			if emit != nil {
+				emit.emitToolInputStart(id, toolName)
+			}
+			return nil
+		},
+
+		OnToolInputDelta: func(id, delta string) error {
+			if emit != nil {
+				emit.emitToolInputDelta(id, delta)
+			}
+			return nil
+		},
+
+		OnToolInputEnd: func(id string) error {
+			if emit != nil {
+				emit.emitToolInputEnd(id)
+			}
+			return nil
+		},
+
+		// ── Tool execution ──
+
+		OnToolCall: func(tc fantasy.ToolCallContent) error {
+			if emit != nil {
+				emit.emitToolCall(tc.ToolCallID, tc.ToolName, tc.Input, tc.ProviderExecuted)
+			}
+			return nil
+		},
+
+		OnToolResult: func(tr fantasy.ToolResultContent) error {
+			// Extract output text and error status from the Result interface
+			var outputText string
+			var isError bool
+			var mediaType, mediaData string
+
+			switch v := tr.Result.(type) {
+			case fantasy.ToolResultOutputContentText:
+				outputText = v.Text
+			case fantasy.ToolResultOutputContentError:
+				outputText = v.Error.Error()
+				isError = true
+			case fantasy.ToolResultOutputContentMedia:
+				outputText = v.Text
+				mediaType = v.MediaType
+				mediaData = v.Data
+			}
+
+			// Persist metadata so it survives working memory serialization
+			s.memory.StoreToolMeta(tr.ToolCallID, tr.ClientMetadata)
+
+			if emit != nil {
+				emit.emitToolResult(tr.ToolCallID, tr.ToolName, outputText, isError, tr.ClientMetadata, mediaType, mediaData)
+			}
+			return nil
+		},
+
+		// ── Sources, warnings, stream finish ──
+
+		OnSource: func(src fantasy.SourceContent) error {
+			if emit != nil {
+				emit.emitSource(src.ID, string(src.SourceType), src.URL, src.Title)
+			}
+			return nil
+		},
+
+		OnWarnings: func(warnings []fantasy.CallWarning) error {
+			if emit != nil {
+				emit.emitWarnings(warnings)
+			}
+			return nil
+		},
+
+		OnStreamFinish: func(u fantasy.Usage, fr fantasy.FinishReason, _ fantasy.ProviderMetadata) error {
+			if emit != nil {
+				emit.emitStreamFinish(u, fr)
+			}
+			return nil
+		},
+
+		// ── Error ──
+
+		OnError: func(err error) {
+			if emit != nil {
+				emit.emitAgentError(s.agentName, err, isRetryableError(err))
+			}
+		},
+	}
+
+	// cleanup closes any unclosed step spans (edge case: error during step)
+	cleanup := func() {
+		res.mu.Lock()
+		if activeStepSpan != nil {
+			activeStepSpan.End()
+			activeStepSpan = nil
+		}
+		res.mu.Unlock()
+		_ = activeStepCtx // used by tool spans via context propagation
+	}
+
+	return call, res, cleanup
+}
+
 // ── Streaming prompt with full FEP ──
 
 func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request) {
@@ -1010,15 +1284,6 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 		s.budget.UpdatePerTurn(memoryCtx, resourceCtx, req.Prompt, messages)
 	}
 
-	// Step counter (shared across callbacks)
-	var stepCount int
-	var stepMu sync.Mutex
-
-	// Track active step span for proper parent-child nesting.
-	// Tool calls within a step become children of the step span.
-	var activeStepCtx context.Context
-	var activeStepSpan trace.Span
-
 	// Emit agent start with trace ID and context budget snapshot
 	traceID := traceIDFromContext(ctx)
 	budgetSnap := s.budget.Snapshot()
@@ -1026,218 +1291,33 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 
 	// TTFT tracking: record time from stream start to first text token
 	streamStart := time.Now()
-	var ttftOnce sync.Once
-
-	result, usedModel, err := streamWithFallback(ctx, s.cfg, s.bundle, fantasy.AgentStreamCall{
-		Prompt:   req.Prompt,
-		Messages: messages,
-
-		// ── Agent lifecycle ──
-
-		OnAgentStart: func() {
-			// Already emitted above before the call
-		},
-
-		OnAgentFinish: func(ar *fantasy.AgentResult) error {
-			// Handled after streamWithFallback returns for cleaner flow
-			return nil
-		},
-
-		// ── Step lifecycle ──
-
-		OnStepStart: func(stepNumber int) error {
-			stepMu.Lock()
-			stepCount = stepNumber
-
-			// End previous step span if still open
-			if activeStepSpan != nil {
-				activeStepSpan.End()
-			}
-
-			// Start a new step span as child of the root prompt span
-			activeStepCtx, activeStepSpan = tracer.Start(ctx, "agent.step", trace.WithAttributes(
-				attrStepNumber.Int(stepNumber),
-				attrAgentName.String(s.agentName),
-			))
-			stepMu.Unlock()
-
-			emit.emitStepStart(stepNumber, s.agentName)
-
-			// Inject steer message if pending
-			if msg := sc.popSteerMessage(); msg != "" {
-				s.memory.Append(fantasy.NewUserMessage("[STEER] " + msg))
-				slog.Info("steer message injected", "message", truncate(msg, 100))
-			}
-
-			return nil
-		},
-
-		OnStepFinish: func(sr fantasy.StepResult) error {
-			stepMu.Lock()
-			currentStep := stepCount
-			stepSpan := activeStepSpan
-			stepMu.Unlock()
-
-			toolCallCount := len(sr.Content.ToolCalls())
-
-			// Set step span attributes and end it
-			if stepSpan != nil {
-				stepSpan.SetAttributes(
-					attrStepFinishReason.String(string(sr.FinishReason)),
-					attrStepToolCalls.Int(toolCallCount),
-					attrGenAIInputTokens.Int64(sr.Usage.InputTokens),
-					attrGenAIOutputTokens.Int64(sr.Usage.OutputTokens),
-				)
-				if sr.Usage.ReasoningTokens > 0 {
-					stepSpan.SetAttributes(attrGenAIReasoningTokens.Int64(sr.Usage.ReasoningTokens))
-				}
-				stepSpan.End()
-
-				stepMu.Lock()
-				activeStepSpan = nil
-				activeStepCtx = nil
-				stepMu.Unlock()
-			}
-
-			// Update budget with actual token usage from API response
-			s.budget.UpdateActual(sr.Usage)
-			stepBudgetSnap := s.budget.Snapshot()
-			emit.emitStepFinish(currentStep, s.agentName, sr.Usage, sr.FinishReason, toolCallCount, &stepBudgetSnap)
-			return nil
-		},
-
-		// ── Text streaming ──
-
-		OnTextStart: func(id string) error {
-			emit.emitTextStart(id)
-			return nil
-		},
-
-		OnTextDelta: func(id, text string) error {
-			// Record TTFT on the first text delta
-			ttftOnce.Do(func() {
-				elapsed := time.Since(streamStart)
-				if metricTTFT != nil {
-					metricTTFT.Record(ctx, elapsed.Seconds(),
-						metric.WithAttributes(
-							attrGenAIOperationName.String("chat"),
-							attrGenAIRequestModel.String(s.cfg.PrimaryModel),
-							attrGenAIProviderName.String(detectGenAIProvider(s.cfg.PrimaryModel, s.cfg.PrimaryProvider)),
-						),
-					)
-				}
-				promptSpan.AddEvent("gen_ai.first_token", trace.WithAttributes(
-					attribute.Float64("gen_ai.server.time_to_first_token", elapsed.Seconds()),
-				))
-				slog.Info("time to first token recorded", "ttft_s", elapsed.Seconds())
-			})
-			emit.emitTextDelta(id, text)
-			return nil
-		},
-
-		OnTextEnd: func(id string) error {
-			emit.emitTextEnd(id)
-			return nil
-		},
-
-		// ── Reasoning streaming ──
-
-		OnReasoningStart: func(id string, _ fantasy.ReasoningContent) error {
-			emit.emitReasoningStart(id)
-			return nil
-		},
-
-		OnReasoningDelta: func(id, text string) error {
-			emit.emitReasoningDelta(id, text)
-			return nil
-		},
-
-		OnReasoningEnd: func(id string, _ fantasy.ReasoningContent) error {
-			emit.emitReasoningEnd(id)
-			return nil
-		},
-
-		// ── Tool input streaming (the big UX win — Pi cannot do this) ──
-
-		OnToolInputStart: func(id, toolName string) error {
-			emit.emitToolInputStart(id, toolName)
-			return nil
-		},
-
-		OnToolInputDelta: func(id, delta string) error {
-			emit.emitToolInputDelta(id, delta)
-			return nil
-		},
-
-		OnToolInputEnd: func(id string) error {
-			emit.emitToolInputEnd(id)
-			return nil
-		},
-
-		// ── Tool execution ──
-
-		OnToolCall: func(tc fantasy.ToolCallContent) error {
-			emit.emitToolCall(tc.ToolCallID, tc.ToolName, tc.Input, tc.ProviderExecuted)
-			return nil
-		},
-
-		OnToolResult: func(tr fantasy.ToolResultContent) error {
-			// Extract output text and error status from the Result interface
-			var outputText string
-			var isError bool
-			var mediaType, mediaData string
-
-			switch v := tr.Result.(type) {
-			case fantasy.ToolResultOutputContentText:
-				outputText = v.Text
-			case fantasy.ToolResultOutputContentError:
-				outputText = v.Error.Error()
-				isError = true
-			case fantasy.ToolResultOutputContentMedia:
-				outputText = v.Text
-				mediaType = v.MediaType
-				mediaData = v.Data
-			}
-
-			// Persist metadata so it survives working memory serialization
-			s.memory.StoreToolMeta(tr.ToolCallID, tr.ClientMetadata)
-
-			emit.emitToolResult(tr.ToolCallID, tr.ToolName, outputText, isError, tr.ClientMetadata, mediaType, mediaData)
-			return nil
-		},
-
-		// ── Sources, warnings, stream finish ──
-
-		OnSource: func(src fantasy.SourceContent) error {
-			emit.emitSource(src.ID, string(src.SourceType), src.URL, src.Title)
-			return nil
-		},
-
-		OnWarnings: func(warnings []fantasy.CallWarning) error {
-			emit.emitWarnings(warnings)
-			return nil
-		},
-
-		OnStreamFinish: func(u fantasy.Usage, fr fantasy.FinishReason, _ fantasy.ProviderMetadata) error {
-			emit.emitStreamFinish(u, fr)
-			return nil
-		},
-
-		// ── Error ──
-
-		OnError: func(err error) {
-			emit.emitAgentError(s.agentName, err, isRetryableError(err))
-		},
-	})
-
-	// End any step span that wasn't closed (edge case: error during step)
-	stepMu.Lock()
-	if activeStepSpan != nil {
-		activeStepSpan.End()
-		activeStepSpan = nil
+	onTTFT := func() {
+		elapsed := time.Since(streamStart)
+		if metricTTFT != nil {
+			metricTTFT.Record(ctx, elapsed.Seconds(),
+				metric.WithAttributes(
+					attrGenAIOperationName.String("chat"),
+					attrGenAIRequestModel.String(s.cfg.PrimaryModel),
+					attrGenAIProviderName.String(detectGenAIProvider(s.cfg.PrimaryModel, s.cfg.PrimaryProvider)),
+				),
+			)
+		}
+		promptSpan.AddEvent("gen_ai.first_token", trace.WithAttributes(
+			attribute.Float64("gen_ai.server.time_to_first_token", elapsed.Seconds()),
+		))
+		slog.Info("time to first token recorded", "ttft_s", elapsed.Seconds())
 	}
-	stepMu.Unlock()
-	_ = activeStepCtx // used by tool spans via context propagation
+
+	call, cbRes, cleanup := s.buildStreamCallbacks(streamCallbacksConfig{
+		emit:     emit,
+		prompt:   req.Prompt,
+		messages: messages,
+		ctx:      ctx,
+		sc:       sc,
+		onTTFT:   onTTFT,
+	})
+	result, usedModel, err := streamWithFallback(ctx, s.cfg, s.bundle, call)
+	cleanup()
 
 	if err != nil {
 		recordError(promptSpan, err)
@@ -1250,9 +1330,7 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 		}
 		s.memory.CompleteTurn()
 
-		stepMu.Lock()
-		finalSteps := stepCount
-		stepMu.Unlock()
+		finalSteps := cbRes.FinalStepCount()
 
 		s.mu.Lock()
 		s.activeModel = usedModel
@@ -1361,14 +1439,6 @@ func (s *daemonServer) handleInternalPrompt(prompt string) {
 		s.budget.UpdatePerTurn(memoryCtx, "", prompt, messages)
 	}
 
-	// Step counter (shared across callbacks)
-	var stepCount int
-	var stepMu sync.Mutex
-
-	// Track active step span for proper parent-child nesting
-	var activeStepCtx context.Context
-	var activeStepSpan trace.Span
-
 	// Emit agent start with trace ID and context budget snapshot
 	traceID := traceIDFromContext(ctx)
 	budgetSnap := s.budget.Snapshot()
@@ -1376,227 +1446,16 @@ func (s *daemonServer) handleInternalPrompt(prompt string) {
 		emit.emitAgentStart(s.agentName, prompt, traceID, &budgetSnap)
 	}
 
-	result, usedModel, err := streamWithFallback(ctx, s.cfg, s.bundle, fantasy.AgentStreamCall{
-		Prompt:   prompt,
-		Messages: messages,
-
-		// ── Agent lifecycle ──
-
-		OnAgentStart: func() {
-			// Already emitted above before the call
-		},
-
-		OnAgentFinish: func(ar *fantasy.AgentResult) error {
-			// Handled after streamWithFallback returns
-			return nil
-		},
-
-		// ── Step lifecycle ──
-
-		OnStepStart: func(stepNumber int) error {
-			stepMu.Lock()
-			stepCount = stepNumber
-
-			if activeStepSpan != nil {
-				activeStepSpan.End()
-			}
-
-			activeStepCtx, activeStepSpan = tracer.Start(ctx, "agent.step", trace.WithAttributes(
-				attrStepNumber.Int(stepNumber),
-				attrAgentName.String(s.agentName),
-			))
-			stepMu.Unlock()
-
-			if emit != nil {
-				emit.emitStepStart(stepNumber, s.agentName)
-			}
-
-			// Inject steer message if pending
-			if msg := sc.popSteerMessage(); msg != "" {
-				s.memory.Append(fantasy.NewUserMessage("[STEER] " + msg))
-				slog.Info("steer message injected (internal)", "message", truncate(msg, 100))
-			}
-
-			return nil
-		},
-
-		OnStepFinish: func(sr fantasy.StepResult) error {
-			stepMu.Lock()
-			currentStep := stepCount
-			stepSpan := activeStepSpan
-			stepMu.Unlock()
-
-			toolCallCount := len(sr.Content.ToolCalls())
-
-			if stepSpan != nil {
-				stepSpan.SetAttributes(
-					attrStepFinishReason.String(string(sr.FinishReason)),
-					attrStepToolCalls.Int(toolCallCount),
-					attrGenAIInputTokens.Int64(sr.Usage.InputTokens),
-					attrGenAIOutputTokens.Int64(sr.Usage.OutputTokens),
-				)
-				if sr.Usage.ReasoningTokens > 0 {
-					stepSpan.SetAttributes(attrGenAIReasoningTokens.Int64(sr.Usage.ReasoningTokens))
-				}
-				stepSpan.End()
-
-				stepMu.Lock()
-				activeStepSpan = nil
-				activeStepCtx = nil
-				stepMu.Unlock()
-			}
-
-			s.budget.UpdateActual(sr.Usage)
-			if emit != nil {
-				stepBudgetSnap := s.budget.Snapshot()
-				emit.emitStepFinish(currentStep, s.agentName, sr.Usage, sr.FinishReason, toolCallCount, &stepBudgetSnap)
-			}
-			return nil
-		},
-
-		// ── Text streaming ──
-
-		OnTextStart: func(id string) error {
-			if emit != nil {
-				emit.emitTextStart(id)
-			}
-			return nil
-		},
-
-		OnTextDelta: func(id, text string) error {
-			if emit != nil {
-				emit.emitTextDelta(id, text)
-			}
-			return nil
-		},
-
-		OnTextEnd: func(id string) error {
-			if emit != nil {
-				emit.emitTextEnd(id)
-			}
-			return nil
-		},
-
-		// ── Reasoning streaming ──
-
-		OnReasoningStart: func(id string, _ fantasy.ReasoningContent) error {
-			if emit != nil {
-				emit.emitReasoningStart(id)
-			}
-			return nil
-		},
-
-		OnReasoningDelta: func(id, text string) error {
-			if emit != nil {
-				emit.emitReasoningDelta(id, text)
-			}
-			return nil
-		},
-
-		OnReasoningEnd: func(id string, _ fantasy.ReasoningContent) error {
-			if emit != nil {
-				emit.emitReasoningEnd(id)
-			}
-			return nil
-		},
-
-		// ── Tool input streaming ──
-
-		OnToolInputStart: func(id, toolName string) error {
-			if emit != nil {
-				emit.emitToolInputStart(id, toolName)
-			}
-			return nil
-		},
-
-		OnToolInputDelta: func(id, delta string) error {
-			if emit != nil {
-				emit.emitToolInputDelta(id, delta)
-			}
-			return nil
-		},
-
-		OnToolInputEnd: func(id string) error {
-			if emit != nil {
-				emit.emitToolInputEnd(id)
-			}
-			return nil
-		},
-
-		// ── Tool execution ──
-
-		OnToolCall: func(tc fantasy.ToolCallContent) error {
-			if emit != nil {
-				emit.emitToolCall(tc.ToolCallID, tc.ToolName, tc.Input, tc.ProviderExecuted)
-			}
-			return nil
-		},
-
-		OnToolResult: func(tr fantasy.ToolResultContent) error {
-			var outputText string
-			var isError bool
-			var mediaType, mediaData string
-
-			switch v := tr.Result.(type) {
-			case fantasy.ToolResultOutputContentText:
-				outputText = v.Text
-			case fantasy.ToolResultOutputContentError:
-				outputText = v.Error.Error()
-				isError = true
-			case fantasy.ToolResultOutputContentMedia:
-				outputText = v.Text
-				mediaType = v.MediaType
-				mediaData = v.Data
-			}
-
-			s.memory.StoreToolMeta(tr.ToolCallID, tr.ClientMetadata)
-
-			if emit != nil {
-				emit.emitToolResult(tr.ToolCallID, tr.ToolName, outputText, isError, tr.ClientMetadata, mediaType, mediaData)
-			}
-			return nil
-		},
-
-		// ── Sources, warnings, stream finish ──
-
-		OnSource: func(src fantasy.SourceContent) error {
-			if emit != nil {
-				emit.emitSource(src.ID, string(src.SourceType), src.URL, src.Title)
-			}
-			return nil
-		},
-
-		OnWarnings: func(warnings []fantasy.CallWarning) error {
-			if emit != nil {
-				emit.emitWarnings(warnings)
-			}
-			return nil
-		},
-
-		OnStreamFinish: func(u fantasy.Usage, fr fantasy.FinishReason, _ fantasy.ProviderMetadata) error {
-			if emit != nil {
-				emit.emitStreamFinish(u, fr)
-			}
-			return nil
-		},
-
-		// ── Error ──
-
-		OnError: func(err error) {
-			if emit != nil {
-				emit.emitAgentError(s.agentName, err, isRetryableError(err))
-			}
-		},
+	call, cbRes, cleanup := s.buildStreamCallbacks(streamCallbacksConfig{
+		emit:           emit,
+		prompt:         prompt,
+		messages:       messages,
+		ctx:            ctx,
+		sc:             sc,
+		steerLogSuffix: " (internal)",
 	})
-
-	// End any step span that wasn't closed
-	stepMu.Lock()
-	if activeStepSpan != nil {
-		activeStepSpan.End()
-		activeStepSpan = nil
-	}
-	stepMu.Unlock()
-	_ = activeStepCtx
+	result, usedModel, err := streamWithFallback(ctx, s.cfg, s.bundle, call)
+	cleanup()
 
 	if err != nil {
 		recordError(promptSpan, err)
@@ -1612,9 +1471,7 @@ func (s *daemonServer) handleInternalPrompt(prompt string) {
 		}
 		s.memory.CompleteTurn()
 
-		stepMu.Lock()
-		finalSteps := stepCount
-		stepMu.Unlock()
+		finalSteps := cbRes.FinalStepCount()
 
 		s.mu.Lock()
 		s.activeModel = usedModel

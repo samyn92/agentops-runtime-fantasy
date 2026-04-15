@@ -116,12 +116,6 @@ func (wm *WorkingMemory) RestoreCheckpoint() int {
 	return len(messages)
 }
 
-// RemoveCheckpoint deletes the checkpoint file.
-// Called when working memory is explicitly cleared by the user.
-func RemoveCheckpoint() {
-	os.Remove(checkpointPath)
-}
-
 // serializeMessages converts Fantasy messages to the JSON-safe format.
 // Reuses the serializableMessage types from handleGetWorkingMemory.
 // toolMeta is the side-map of toolCallID → ClientMetadata JSON.
