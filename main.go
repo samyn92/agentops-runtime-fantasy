@@ -642,6 +642,10 @@ func runDaemon() error {
 
 	httpSrv := &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: otelhttp.NewHandler(mux, "agentops-runtime",
 		otelhttp.WithMessageEvents(otelhttp.ReadEvents, otelhttp.WriteEvents),
+		otelhttp.WithFilter(func(r *http.Request) bool {
+			// Skip tracing for health/status probes — they generate noise in Tempo.
+			return r.URL.Path != "/healthz" && r.URL.Path != "/status"
+		}),
 	)}
 
 	go func() {
