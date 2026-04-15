@@ -3,37 +3,69 @@ Agent Runtime — Fantasy (Go)
 
 FEP (Fantasy Event Protocol) SSE emitter.
 Maps Fantasy SDK streaming callbacks to SSE events for the console.
+Supports multiple backends: HTTP SSE (per-request) and NATS (persistent).
 */
 package main
 
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
 	"charm.land/fantasy"
+	"github.com/nats-io/nats.go"
 )
 
-// fepEmitter writes FEP-formatted SSE events to an HTTP response.
-// All writes are mutex-protected because Fantasy callbacks may fire
-// from different goroutines.
+// ── Emitter abstraction ──
+// All emit* methods call emit(). Backends implement this single method.
+
+// fepBackend is the low-level write target for FEP events.
+type fepBackend interface {
+	emit(eventType string, fields map[string]any)
+}
+
+// fepEmitter is the main FEP emitter used throughout the runtime.
+// It holds one or more backends (SSE writer, NATS publisher, etc.)
+// and fans out every event to all of them.
 type fepEmitter struct {
-	w  http.ResponseWriter
-	f  http.Flusher
-	mu sync.Mutex
+	backends []fepBackend
+	mu       sync.Mutex
 }
 
-// newFEPEmitter creates a new FEP SSE emitter. The caller must have
-// already set Content-Type: text/event-stream on w.
+// newFEPEmitter creates an emitter with an SSE backend writing to w.
 func newFEPEmitter(w http.ResponseWriter) *fepEmitter {
-	f, _ := w.(http.Flusher)
-	return &fepEmitter{w: w, f: f}
+	return &fepEmitter{
+		backends: []fepBackend{&sseBackend{w: w, f: w.(http.Flusher)}},
+	}
 }
 
-// emit writes a single SSE data frame: data: {"type":"<eventType>", "timestamp":"...", ...fields}\n\n
-// Every event gets a UTC RFC3339 timestamp automatically.
+// newNATSOnlyEmitter creates an emitter backed only by NATS (no HTTP writer).
+// Used by handleInternalPrompt where no browser SSE stream exists.
+func newNATSOnlyEmitter(np *natsPublisher) *fepEmitter {
+	if np == nil {
+		return nil
+	}
+	return &fepEmitter{
+		backends: []fepBackend{np},
+	}
+}
+
+// withNATS returns a new emitter that also publishes to NATS.
+func (e *fepEmitter) withNATS(np *natsPublisher) *fepEmitter {
+	if np == nil {
+		return e
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.backends = append(e.backends, np)
+	return e
+}
+
+// emit fans out to all backends.
 func (e *fepEmitter) emit(eventType string, fields map[string]any) {
 	if fields == nil {
 		fields = make(map[string]any)
@@ -41,16 +73,103 @@ func (e *fepEmitter) emit(eventType string, fields map[string]any) {
 	fields["type"] = eventType
 	fields["timestamp"] = time.Now().UTC().Format(time.RFC3339)
 
-	payload, err := json.Marshal(fields)
-	if err != nil {
-		payload = []byte(fmt.Sprintf(`{"type":"%s","error":"marshal failed"}`, eventType))
-	}
-
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	fmt.Fprintf(e.w, "data: %s\n\n", payload)
-	if e.f != nil {
-		e.f.Flush()
+	for _, b := range e.backends {
+		b.emit(eventType, fields)
+	}
+}
+
+// ── SSE backend — writes to HTTP response ──
+
+type sseBackend struct {
+	w  http.ResponseWriter
+	f  http.Flusher
+	mu sync.Mutex
+}
+
+func (s *sseBackend) emit(_ string, fields map[string]any) {
+	payload, err := json.Marshal(fields)
+	if err != nil {
+		payload = []byte(fmt.Sprintf(`{"type":"%s","error":"marshal failed"}`, fields["type"]))
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fmt.Fprintf(s.w, "data: %s\n\n", payload)
+	if s.f != nil {
+		s.f.Flush()
+	}
+}
+
+// ── NATS backend — publishes to NATS subjects ──
+// Subject format: agents.{namespace}.{agentName}.fep.{eventType}
+// The BFF subscribes to agents.> and injects events into its SSE multiplexer.
+
+type natsPublisher struct {
+	nc        *nats.Conn
+	namespace string
+	agentName string
+}
+
+// newNATSPublisher connects to NATS and returns a publisher.
+// Returns nil if NATS_URL is not set (graceful degradation).
+func newNATSPublisher(namespace, agentName string) *natsPublisher {
+	url := os.Getenv("NATS_URL")
+	if url == "" {
+		slog.Info("NATS_URL not set, FEP NATS publishing disabled")
+		return nil
+	}
+
+	nc, err := nats.Connect(url,
+		nats.Name(fmt.Sprintf("agentops-runtime/%s/%s", namespace, agentName)),
+		nats.RetryOnFailedConnect(true),
+		nats.MaxReconnects(-1), // reconnect forever
+		nats.ReconnectWait(2*time.Second),
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			if err != nil {
+				slog.Warn("NATS disconnected", "error", err)
+			}
+		}),
+		nats.ReconnectHandler(func(_ *nats.Conn) {
+			slog.Info("NATS reconnected")
+		}),
+	)
+	if err != nil {
+		slog.Error("failed to connect to NATS", "url", url, "error", err)
+		return nil
+	}
+
+	slog.Info("NATS publisher connected", "url", url, "namespace", namespace, "agent", agentName)
+	return &natsPublisher{
+		nc:        nc,
+		namespace: namespace,
+		agentName: agentName,
+	}
+}
+
+func (n *natsPublisher) emit(eventType string, fields map[string]any) {
+	if n.nc == nil {
+		return
+	}
+
+	// Subject: agents.{namespace}.{agentName}.fep.{eventType}
+	subject := fmt.Sprintf("agents.%s.%s.fep.%s", n.namespace, n.agentName, eventType)
+
+	payload, err := json.Marshal(fields)
+	if err != nil {
+		slog.Warn("NATS: failed to marshal FEP event", "type", eventType, "error", err)
+		return
+	}
+
+	if err := n.nc.Publish(subject, payload); err != nil {
+		slog.Warn("NATS: failed to publish FEP event", "subject", subject, "error", err)
+	}
+}
+
+func (n *natsPublisher) close() {
+	if n.nc != nil {
+		n.nc.Drain()
 	}
 }
 

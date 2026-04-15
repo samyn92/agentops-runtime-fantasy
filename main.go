@@ -518,6 +518,11 @@ func runDaemon() error {
 		convCtx:     &sessionContext{},
 	}
 
+	// Initialize NATS publisher for persistent FEP event delivery.
+	// This allows delegation callbacks and internal prompts to emit FEP events
+	// even when no browser SSE stream is connected.
+	srv.natsPub = newNATSPublisher(agentNamespace, agentName)
+
 	// Wire up the DelegationWatcher trigger and emitter functions.
 	// The trigger queues delegation results as a steer message when the agent
 	// is busy, or starts a new internal prompt when idle.
@@ -542,7 +547,12 @@ func runDaemon() error {
 			srv.convCtx.mu.Lock()
 			emit := srv.convCtx.emitter
 			srv.convCtx.mu.Unlock()
-			return emit
+			if emit != nil {
+				return emit
+			}
+			// No active SSE stream — fall back to NATS-only emitter so
+			// delegation events are always delivered to the BFF.
+			return newNATSOnlyEmitter(srv.natsPub)
 		})
 	}
 
@@ -674,6 +684,11 @@ func runDaemon() error {
 			}
 		}
 
+		// Drain NATS connection (flushes buffered publishes before close)
+		if srv.natsPub != nil {
+			srv.natsPub.close()
+		}
+
 		httpSrv.Close()
 	}()
 
@@ -714,6 +729,7 @@ type daemonServer struct {
 	permGate     *permissionGate
 	questionGate *questionGate
 	delegation   *DelegationWatcher // tracks parallel fan-out delegation groups
+	natsPub      *natsPublisher     // persistent NATS FEP publisher (nil if NATS_URL not set)
 
 	mu      sync.Mutex
 	convCtx *sessionContext // single conversation context
@@ -949,7 +965,7 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 	// Record the user prompt as a content event for trace visibility
 	recordPromptEvent(promptSpan, req.Prompt)
 
-	emit := newFEPEmitter(w)
+	emit := newFEPEmitter(w).withNATS(s.natsPub)
 
 	// Store the emitter on the conversation context so permission/question
 	// gates can emit FEP events through the active SSE stream.
@@ -1265,8 +1281,8 @@ func (s *daemonServer) handlePromptStream(w http.ResponseWriter, r *http.Request
 
 // handleInternalPrompt runs the agent loop with an internal prompt (no HTTP request).
 // Used by the DelegationWatcher to inject delegation results when the agent is idle.
-// This follows the same flow as handlePrompt (non-streaming) to avoid requiring an
-// active SSE connection. Results are appended to working memory.
+// Uses streaming via NATS so the BFF receives real-time FEP events even without an
+// active browser SSE connection. Results are appended to working memory.
 func (s *daemonServer) handleInternalPrompt(prompt string) {
 	sc := s.convCtx
 	sc.mu.Lock()
@@ -1304,6 +1320,24 @@ func (s *daemonServer) handleInternalPrompt(prompt string) {
 
 	recordPromptEvent(promptSpan, prompt)
 
+	// Create NATS-only emitter — events flow to BFF without a browser SSE stream.
+	// If NATS is unavailable, emit is nil and FEP events are silently dropped
+	// (the result still lands in working memory for hydration on next page load).
+	emit := newNATSOnlyEmitter(s.natsPub)
+
+	// Store emitter on session context so nested delegation events and
+	// permission/question gates can find it during the internal prompt.
+	if emit != nil {
+		sc.mu.Lock()
+		sc.emitter = emit
+		sc.mu.Unlock()
+		defer func() {
+			sc.mu.Lock()
+			sc.emitter = nil
+			sc.mu.Unlock()
+		}()
+	}
+
 	// Get messages from working memory
 	messages := s.memory.Messages()
 
@@ -1327,44 +1361,291 @@ func (s *daemonServer) handleInternalPrompt(prompt string) {
 		s.budget.UpdatePerTurn(memoryCtx, "", prompt, messages)
 	}
 
-	result, usedModel, err := generateWithFallback(ctx, s.cfg, s.bundle, fantasy.AgentCall{
+	// Step counter (shared across callbacks)
+	var stepCount int
+	var stepMu sync.Mutex
+
+	// Track active step span for proper parent-child nesting
+	var activeStepCtx context.Context
+	var activeStepSpan trace.Span
+
+	// Emit agent start with trace ID and context budget snapshot
+	traceID := traceIDFromContext(ctx)
+	budgetSnap := s.budget.Snapshot()
+	if emit != nil {
+		emit.emitAgentStart(s.agentName, prompt, traceID, &budgetSnap)
+	}
+
+	result, usedModel, err := streamWithFallback(ctx, s.cfg, s.bundle, fantasy.AgentStreamCall{
 		Prompt:   prompt,
 		Messages: messages,
+
+		// ── Agent lifecycle ──
+
+		OnAgentStart: func() {
+			// Already emitted above before the call
+		},
+
+		OnAgentFinish: func(ar *fantasy.AgentResult) error {
+			// Handled after streamWithFallback returns
+			return nil
+		},
+
+		// ── Step lifecycle ──
+
+		OnStepStart: func(stepNumber int) error {
+			stepMu.Lock()
+			stepCount = stepNumber
+
+			if activeStepSpan != nil {
+				activeStepSpan.End()
+			}
+
+			activeStepCtx, activeStepSpan = tracer.Start(ctx, "agent.step", trace.WithAttributes(
+				attrStepNumber.Int(stepNumber),
+				attrAgentName.String(s.agentName),
+			))
+			stepMu.Unlock()
+
+			if emit != nil {
+				emit.emitStepStart(stepNumber, s.agentName)
+			}
+
+			// Inject steer message if pending
+			if msg := sc.popSteerMessage(); msg != "" {
+				s.memory.Append(fantasy.NewUserMessage("[STEER] " + msg))
+				slog.Info("steer message injected (internal)", "message", truncate(msg, 100))
+			}
+
+			return nil
+		},
+
+		OnStepFinish: func(sr fantasy.StepResult) error {
+			stepMu.Lock()
+			currentStep := stepCount
+			stepSpan := activeStepSpan
+			stepMu.Unlock()
+
+			toolCallCount := len(sr.Content.ToolCalls())
+
+			if stepSpan != nil {
+				stepSpan.SetAttributes(
+					attrStepFinishReason.String(string(sr.FinishReason)),
+					attrStepToolCalls.Int(toolCallCount),
+					attrGenAIInputTokens.Int64(sr.Usage.InputTokens),
+					attrGenAIOutputTokens.Int64(sr.Usage.OutputTokens),
+				)
+				if sr.Usage.ReasoningTokens > 0 {
+					stepSpan.SetAttributes(attrGenAIReasoningTokens.Int64(sr.Usage.ReasoningTokens))
+				}
+				stepSpan.End()
+
+				stepMu.Lock()
+				activeStepSpan = nil
+				activeStepCtx = nil
+				stepMu.Unlock()
+			}
+
+			s.budget.UpdateActual(sr.Usage)
+			if emit != nil {
+				stepBudgetSnap := s.budget.Snapshot()
+				emit.emitStepFinish(currentStep, s.agentName, sr.Usage, sr.FinishReason, toolCallCount, &stepBudgetSnap)
+			}
+			return nil
+		},
+
+		// ── Text streaming ──
+
+		OnTextStart: func(id string) error {
+			if emit != nil {
+				emit.emitTextStart(id)
+			}
+			return nil
+		},
+
+		OnTextDelta: func(id, text string) error {
+			if emit != nil {
+				emit.emitTextDelta(id, text)
+			}
+			return nil
+		},
+
+		OnTextEnd: func(id string) error {
+			if emit != nil {
+				emit.emitTextEnd(id)
+			}
+			return nil
+		},
+
+		// ── Reasoning streaming ──
+
+		OnReasoningStart: func(id string, _ fantasy.ReasoningContent) error {
+			if emit != nil {
+				emit.emitReasoningStart(id)
+			}
+			return nil
+		},
+
+		OnReasoningDelta: func(id, text string) error {
+			if emit != nil {
+				emit.emitReasoningDelta(id, text)
+			}
+			return nil
+		},
+
+		OnReasoningEnd: func(id string, _ fantasy.ReasoningContent) error {
+			if emit != nil {
+				emit.emitReasoningEnd(id)
+			}
+			return nil
+		},
+
+		// ── Tool input streaming ──
+
+		OnToolInputStart: func(id, toolName string) error {
+			if emit != nil {
+				emit.emitToolInputStart(id, toolName)
+			}
+			return nil
+		},
+
+		OnToolInputDelta: func(id, delta string) error {
+			if emit != nil {
+				emit.emitToolInputDelta(id, delta)
+			}
+			return nil
+		},
+
+		OnToolInputEnd: func(id string) error {
+			if emit != nil {
+				emit.emitToolInputEnd(id)
+			}
+			return nil
+		},
+
+		// ── Tool execution ──
+
+		OnToolCall: func(tc fantasy.ToolCallContent) error {
+			if emit != nil {
+				emit.emitToolCall(tc.ToolCallID, tc.ToolName, tc.Input, tc.ProviderExecuted)
+			}
+			return nil
+		},
+
+		OnToolResult: func(tr fantasy.ToolResultContent) error {
+			var outputText string
+			var isError bool
+			var mediaType, mediaData string
+
+			switch v := tr.Result.(type) {
+			case fantasy.ToolResultOutputContentText:
+				outputText = v.Text
+			case fantasy.ToolResultOutputContentError:
+				outputText = v.Error.Error()
+				isError = true
+			case fantasy.ToolResultOutputContentMedia:
+				outputText = v.Text
+				mediaType = v.MediaType
+				mediaData = v.Data
+			}
+
+			s.memory.StoreToolMeta(tr.ToolCallID, tr.ClientMetadata)
+
+			if emit != nil {
+				emit.emitToolResult(tr.ToolCallID, tr.ToolName, outputText, isError, tr.ClientMetadata, mediaType, mediaData)
+			}
+			return nil
+		},
+
+		// ── Sources, warnings, stream finish ──
+
+		OnSource: func(src fantasy.SourceContent) error {
+			if emit != nil {
+				emit.emitSource(src.ID, string(src.SourceType), src.URL, src.Title)
+			}
+			return nil
+		},
+
+		OnWarnings: func(warnings []fantasy.CallWarning) error {
+			if emit != nil {
+				emit.emitWarnings(warnings)
+			}
+			return nil
+		},
+
+		OnStreamFinish: func(u fantasy.Usage, fr fantasy.FinishReason, _ fantasy.ProviderMetadata) error {
+			if emit != nil {
+				emit.emitStreamFinish(u, fr)
+			}
+			return nil
+		},
+
+		// ── Error ──
+
+		OnError: func(err error) {
+			if emit != nil {
+				emit.emitAgentError(s.agentName, err, isRetryableError(err))
+			}
+		},
 	})
+
+	// End any step span that wasn't closed
+	stepMu.Lock()
+	if activeStepSpan != nil {
+		activeStepSpan.End()
+		activeStepSpan = nil
+	}
+	stepMu.Unlock()
+	_ = activeStepCtx
+
 	if err != nil {
 		recordError(promptSpan, err)
+		if emit != nil {
+			emit.emitAgentError(s.agentName, err, isRetryableError(err))
+		}
 		slog.Error("delegation callback prompt failed", "error", err)
-		return
+	} else {
+		// Append to working memory
+		s.memory.Append(fantasy.NewUserMessage(prompt))
+		for _, step := range result.Steps {
+			s.memory.Append(step.Messages...)
+		}
+		s.memory.CompleteTurn()
+
+		stepMu.Lock()
+		finalSteps := stepCount
+		stepMu.Unlock()
+
+		s.mu.Lock()
+		s.activeModel = usedModel
+		s.totalSteps += finalSteps
+		s.lastTraceID = traceID
+		s.mu.Unlock()
+
+		promptSpan.SetAttributes(
+			attrGenAIResponseModel.String(usedModel),
+			attrGenAIInputTokens.Int64(result.TotalUsage.InputTokens),
+			attrGenAIOutputTokens.Int64(result.TotalUsage.OutputTokens),
+			attribute.Int("agent.steps", finalSteps),
+		)
+
+		recordCompletionEvent(promptSpan, result.Response.Content.Text())
+
+		if emit != nil {
+			emit.emitAgentFinish(s.agentName, result.TotalUsage, finalSteps, usedModel)
+		}
+
+		slog.Info("delegation callback prompt completed",
+			"model", usedModel,
+			"steps", finalSteps,
+			"traceId", traceID,
+		)
 	}
 
-	// Append to working memory
-	s.memory.Append(fantasy.NewUserMessage(prompt))
-	for _, step := range result.Steps {
-		s.memory.Append(step.Messages...)
+	// Signal idle state so BFF knows the agent is available
+	if emit != nil {
+		emit.emitSessionIdle(s.agentName)
 	}
-	s.memory.CompleteTurn()
-
-	traceID := traceIDFromContext(ctx)
-
-	s.mu.Lock()
-	s.activeModel = usedModel
-	s.totalSteps += len(result.Steps)
-	s.lastTraceID = traceID
-	s.mu.Unlock()
-
-	promptSpan.SetAttributes(
-		attrGenAIResponseModel.String(usedModel),
-		attrGenAIInputTokens.Int64(result.TotalUsage.InputTokens),
-		attrGenAIOutputTokens.Int64(result.TotalUsage.OutputTokens),
-		attribute.Int("agent.steps", len(result.Steps)),
-	)
-
-	recordCompletionEvent(promptSpan, result.Response.Content.Text())
-	slog.Info("delegation callback prompt completed",
-		"model", usedModel,
-		"steps", len(result.Steps),
-		"traceId", traceID,
-	)
 }
 
 // ── Steer handler ──
