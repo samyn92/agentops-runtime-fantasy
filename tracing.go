@@ -596,6 +596,8 @@ func detectGenAIProvider(model, provider string) string {
 		return "deepseek"
 	case lower == "openrouter":
 		return "openrouter"
+	case lower == "kimi" || lower == "moonshot":
+		return "kimi"
 	}
 	// Infer from model name
 	m := strings.ToLower(model)
@@ -608,6 +610,8 @@ func detectGenAIProvider(model, provider string) string {
 		return "gcp.gemini"
 	case strings.HasPrefix(m, "deepseek"):
 		return "deepseek"
+	case strings.HasPrefix(m, "moonshot") || strings.HasPrefix(m, "kimi"):
+		return "kimi"
 	}
 	if provider != "" {
 		return provider
