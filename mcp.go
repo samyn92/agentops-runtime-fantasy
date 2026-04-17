@@ -248,7 +248,10 @@ func (m *mcpToolAdapter) Info() fantasy.ToolInfo {
 	params := make(map[string]any)
 	var required []string
 
-	// Extract properties from the tool's input schema
+	// Extract properties from the tool's input schema.
+	// Ensure required is never nil — providers like kimi/moonshot reject
+	// "required": null (must be an array). An empty []string serializes
+	// to "required": [] which is valid JSON Schema.
 	if m.mcpTool.InputSchema != nil {
 		schemaBytes, _ := json.Marshal(m.mcpTool.InputSchema)
 		var schema struct {
@@ -258,6 +261,9 @@ func (m *mcpToolAdapter) Info() fantasy.ToolInfo {
 		json.Unmarshal(schemaBytes, &schema)
 		params = schema.Properties
 		required = schema.Required
+	}
+	if required == nil {
+		required = []string{}
 	}
 
 	return fantasy.ToolInfo{
