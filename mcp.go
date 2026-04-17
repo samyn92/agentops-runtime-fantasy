@@ -265,6 +265,9 @@ func (m *mcpToolAdapter) Info() fantasy.ToolInfo {
 	if required == nil {
 		required = []string{}
 	}
+	if params == nil {
+		params = make(map[string]any)
+	}
 
 	return fantasy.ToolInfo{
 		Name:        m.mcpPrefixedName(),
