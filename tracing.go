@@ -124,22 +124,30 @@ func initTracing(ctx context.Context, agentName, agentNamespace, agentMode strin
 
 	// Initialize OTLP gRPC metric exporter and MeterProvider.
 	// GenAI semantic conventions require operation.duration and token.usage histograms.
-	metricExporter, err := otlpmetricgrpc.New(ctx,
-		otlpmetricgrpc.WithEndpoint(endpoint),
-		otlpmetricgrpc.WithInsecure(),
-	)
-	if err != nil {
-		slog.Warn("metric exporter init failed, using noop metrics", "error", err)
+	// Metrics require a separate endpoint (OTEL_EXPORTER_OTLP_METRICS_ENDPOINT) because
+	// Tempo only accepts traces. When no metrics endpoint is configured, use noop metrics.
+	metricsEndpoint := os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
+	if metricsEndpoint == "" {
+		slog.Info("metrics disabled (OTEL_EXPORTER_OTLP_METRICS_ENDPOINT not set, Tempo only supports traces)")
 		initNoopMetrics()
 	} else {
-		mp := sdkmetric.NewMeterProvider(
-			sdkmetric.WithResource(res),
-			sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExporter,
-				sdkmetric.WithInterval(10*time.Second),
-			)),
+		metricExporter, err := otlpmetricgrpc.New(ctx,
+			otlpmetricgrpc.WithEndpoint(metricsEndpoint),
+			otlpmetricgrpc.WithInsecure(),
 		)
-		otel.SetMeterProvider(mp)
-		initMetrics(mp.Meter("agentops-runtime"))
+		if err != nil {
+			slog.Warn("metric exporter init failed, using noop metrics", "error", err)
+			initNoopMetrics()
+		} else {
+			mp := sdkmetric.NewMeterProvider(
+				sdkmetric.WithResource(res),
+				sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExporter,
+					sdkmetric.WithInterval(10*time.Second),
+				)),
+			)
+			otel.SetMeterProvider(mp)
+			initMetrics(mp.Meter("agentops-runtime"))
+		}
 	}
 
 	slog.Info("tracing enabled",

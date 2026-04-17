@@ -144,14 +144,19 @@ func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, in
 	}
 
 	// Add orchestration tools (run_agent, run_agents, get_agent_run, list_task_agents)
+	// Only agents with a delegation team configured get these tools. Without a team,
+	// task agents would have unrestricted delegation and create infinite loops
+	// (e.g. coder → architect → coder → ...).
 	k8sClient, err := NewK8sClient()
 	var delegationWatcher *DelegationWatcher
 	if err != nil {
 		slog.Warn("K8s client unavailable, orchestration tools disabled", "error", err)
-		tools = append(tools, newRunAgentToolStub(), newRunAgentsToolStub(), newGetAgentRunToolStub(), newListTaskAgentsToolStub())
-	} else {
+	} else if cfg.Delegation != nil && len(cfg.Delegation.Team) > 0 {
 		delegationWatcher = NewDelegationWatcher(k8sClient)
 		tools = append(tools, newRunAgentTool(k8sClient, cfg.Resources, delegationWatcher, cfg.Delegation), newRunAgentsTool(k8sClient, cfg.Resources, delegationWatcher, cfg.Delegation), newGetAgentRunTool(k8sClient), newListTaskAgentsTool(k8sClient, cfg.Delegation))
+		slog.Info("delegation tools enabled", "team", cfg.Delegation.Team)
+	} else {
+		slog.Info("delegation tools disabled (no team configured)")
 	}
 
 	// Add any extra tools (e.g. memory tools from Engram)
