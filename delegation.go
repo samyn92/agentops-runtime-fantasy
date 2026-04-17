@@ -338,6 +338,7 @@ type RunResult struct {
 	Output         string        `json:"output"`
 	ToolCalls      int64         `json:"toolCalls"`
 	Model          string        `json:"model"`
+	TraceID        string        `json:"traceID,omitempty"`
 	Duration       time.Duration `json:"duration"`
 	PullRequestURL string        `json:"pullRequestURL,omitempty"`
 	Commits        int64         `json:"commits,omitempty"`
@@ -358,11 +359,21 @@ type DelegationGroup struct {
 
 // DelegationWatcher manages active delegation groups using K8s Watch.
 type DelegationWatcher struct {
-	k8s       *K8sClient
-	groups    map[string]*DelegationGroup // keyed by group ID
-	mu        sync.Mutex
-	triggerFn func(prompt string) // internal prompt trigger (set by daemon)
-	emitterFn func() *fepEmitter  // get current FEP emitter (may be nil)
+	k8s              *K8sClient
+	groups           map[string]*DelegationGroup // keyed by group ID
+	pendingChildLinks []DelegationChildLink       // child trace IDs from last completed group (consumed by callback)
+	mu               sync.Mutex
+	triggerFn        func(prompt string) // internal prompt trigger (set by daemon)
+	emitterFn        func() *fepEmitter  // get current FEP emitter (may be nil)
+}
+
+// DelegationChildLink holds trace info for a completed child agent, enabling
+// bidirectional span links between parent and child traces.
+type DelegationChildLink struct {
+	AgentName string
+	RunName   string
+	TraceID   string
+	Phase     string
 }
 
 // NewDelegationWatcher creates a new watcher. triggerFn and emitterFn are
@@ -386,6 +397,17 @@ func (dw *DelegationWatcher) SetEmitterFn(fn func() *fepEmitter) {
 	dw.mu.Lock()
 	defer dw.mu.Unlock()
 	dw.emitterFn = fn
+}
+
+// ConsumePendingChildLinks atomically retrieves and clears any pending child
+// trace links from the last completed delegation group. The callback handler
+// uses these to add bidirectional span links to the parent trace.
+func (dw *DelegationWatcher) ConsumePendingChildLinks() []DelegationChildLink {
+	dw.mu.Lock()
+	defer dw.mu.Unlock()
+	links := dw.pendingChildLinks
+	dw.pendingChildLinks = nil
+	return links
 }
 
 // Register adds a delegation group and starts watching its runs.
@@ -675,6 +697,19 @@ func (dw *DelegationWatcher) triggerCallback(group *DelegationGroup) {
 	dw.mu.Lock()
 	delete(dw.groups, group.ID)
 	triggerFn := dw.triggerFn
+
+	// Store child trace links for the callback span to consume
+	dw.pendingChildLinks = nil
+	for runName, result := range group.Runs {
+		if result != nil && result.TraceID != "" {
+			dw.pendingChildLinks = append(dw.pendingChildLinks, DelegationChildLink{
+				AgentName: result.AgentName,
+				RunName:   runName,
+				TraceID:   result.TraceID,
+				Phase:     result.Phase,
+			})
+		}
+	}
 	dw.mu.Unlock()
 
 	// Build callback prompt
@@ -803,6 +838,7 @@ func extractRunStatus(obj map[string]interface{}, runName string) *RunResult {
 			result.Output = rs.Output
 			result.ToolCalls = rs.ToolCalls
 			result.Model = rs.Model
+			result.TraceID = rs.TraceID
 			result.PullRequestURL = rs.PullRequestURL
 			result.Commits = rs.Commits
 			result.Branch = rs.Branch

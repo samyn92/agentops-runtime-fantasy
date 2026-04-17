@@ -251,12 +251,19 @@ func buildFallbackAgent(ctx context.Context, cfg *Config, providers map[string]f
 // streamWithFallback tries the primary model, then fallbacks on retryable errors.
 // Creates a gen_ai.stream span covering the LLM call (including fallback attempts).
 func streamWithFallback(ctx context.Context, cfg *Config, bundle *agentBundle, call fantasy.AgentStreamCall) (*fantasy.AgentResult, string, error) {
-	ctx, span := tracer.Start(ctx, "gen_ai.stream", trace.WithAttributes(
+	modelName := cfg.PrimaryModel
+	ctx, span := tracer.Start(ctx, "chat "+modelName, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attrGenAIOperationName.String("chat"),
 		attrGenAIProviderName.String(detectGenAIProvider(cfg.PrimaryModel, cfg.PrimaryProvider)),
 		attrGenAIRequestModel.String(cfg.PrimaryModel),
 	))
 	defer span.End()
+
+	// Record system prompt as gen_ai.system.message event
+	recordSystemMessageEvent(span, cfg.SystemPrompt)
+
+	// Record tool definitions (opt-in via OTEL_GENAI_CAPTURE_CONTENT)
+	recordToolDefinitionsAttribute(span, bundle.baseTools)
 
 	// Add optional request parameters
 	if cfg.Temperature != nil {
@@ -318,12 +325,19 @@ func streamWithFallback(ctx context.Context, cfg *Config, bundle *agentBundle, c
 // generateWithFallback tries the primary model, then fallbacks on retryable errors.
 // Creates a gen_ai.generate span covering the LLM call (including fallback attempts).
 func generateWithFallback(ctx context.Context, cfg *Config, bundle *agentBundle, call fantasy.AgentCall) (*fantasy.AgentResult, string, error) {
-	ctx, span := tracer.Start(ctx, "gen_ai.generate", trace.WithAttributes(
+	modelName := cfg.PrimaryModel
+	ctx, span := tracer.Start(ctx, "chat "+modelName, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attrGenAIOperationName.String("chat"),
 		attrGenAIProviderName.String(detectGenAIProvider(cfg.PrimaryModel, cfg.PrimaryProvider)),
 		attrGenAIRequestModel.String(cfg.PrimaryModel),
 	))
 	defer span.End()
+
+	// Record system prompt as gen_ai.system.message event
+	recordSystemMessageEvent(span, cfg.SystemPrompt)
+
+	// Record tool definitions (opt-in via OTEL_GENAI_CAPTURE_CONTENT)
+	recordToolDefinitionsAttribute(span, bundle.baseTools)
 
 	// Add optional request parameters
 	if cfg.Temperature != nil {
@@ -1401,6 +1415,38 @@ func (s *daemonServer) handleInternalPrompt(prompt string) {
 	))
 	defer promptSpan.End()
 
+	// Add bidirectional span links to child agent traces (if available).
+	// The delegation watcher stored child trace IDs when the group completed.
+	if s.delegation != nil {
+		childLinks := s.delegation.ConsumePendingChildLinks()
+		var childAgents []string
+		for _, cl := range childLinks {
+			childAgents = append(childAgents, cl.AgentName)
+			childTraceID, err := trace.TraceIDFromHex(cl.TraceID)
+			if err == nil {
+				childSC := trace.NewSpanContext(trace.SpanContextConfig{
+					TraceID:    childTraceID,
+					TraceFlags: trace.FlagsSampled,
+				})
+				promptSpan.AddLink(trace.Link{
+					SpanContext: childSC,
+					Attributes: []attribute.KeyValue{
+						attribute.String("link.type", "delegation_child"),
+						attribute.String("link.child_agent", cl.AgentName),
+						attribute.String("link.run_name", cl.RunName),
+						attribute.String("link.phase", cl.Phase),
+					},
+				})
+			}
+		}
+		if len(childAgents) > 0 {
+			promptSpan.SetAttributes(
+				attribute.StringSlice("delegation.child_agents", childAgents),
+				attribute.Int("delegation.child_count", len(childAgents)),
+			)
+		}
+	}
+
 	recordPromptEvent(promptSpan, prompt)
 
 	// Create NATS-only emitter — events flow to BFF without a browser SSE stream.
@@ -1855,6 +1901,8 @@ type taskResult struct {
 	Success        bool   `json:"success"`
 	Error          string `json:"error,omitempty"`
 	TraceID        string `json:"traceID,omitempty"`
+	InputTokens    int64  `json:"inputTokens,omitempty"`
+	OutputTokens   int64  `json:"outputTokens,omitempty"`
 	PullRequestURL string `json:"pullRequestURL,omitempty"`
 	Commits        int    `json:"commits,omitempty"`
 	Branch         string `json:"branch,omitempty"`
@@ -2021,12 +2069,14 @@ func runTask() error {
 	createRetrospectiveStepSpans(ctx, agentResult.Steps, genStart, genEnd)
 
 	result := taskResult{
-		Output:  output,
-		Steps:   len(agentResult.Steps),
-		Model:   usedModel,
-		Success: true,
-		TraceID: traceID,
-		Branch:  gitBranch,
+		Output:       output,
+		Steps:        len(agentResult.Steps),
+		Model:        usedModel,
+		Success:      true,
+		TraceID:      traceID,
+		InputTokens:  agentResult.TotalUsage.InputTokens,
+		OutputTokens: agentResult.TotalUsage.OutputTokens,
+		Branch:       gitBranch,
 	}
 
 	// Set final attributes on root span

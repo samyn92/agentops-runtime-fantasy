@@ -278,6 +278,7 @@ type AgentRunStatus struct {
 	Output         string `json:"output"`
 	ToolCalls      int64  `json:"toolCalls"`
 	Model          string `json:"model"`
+	TraceID        string `json:"traceID,omitempty"`
 	PullRequestURL string `json:"pullRequestURL,omitempty"`
 	Commits        int64  `json:"commits,omitempty"`
 	Branch         string `json:"branch,omitempty"`

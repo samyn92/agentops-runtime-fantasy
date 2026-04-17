@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -271,7 +272,8 @@ var (
 	attrGenAIAgentID        = attribute.Key("gen_ai.agent.id")        // Unique agent identifier (namespace/name)
 	attrGenAIAgentName      = attribute.Key("gen_ai.agent.name")      // Human-readable agent name
 	attrGenAIConversationID = attribute.Key("gen_ai.conversation.id") // Memory session ID — correlates turns
-	attrGenAIServerAddress  = attribute.Key("server.address")         // LLM API endpoint host
+	attrGenAIServerAddress = attribute.Key("server.address") // LLM API endpoint host
+	attrGenAIServerPort    = attribute.Key("server.port")    // LLM API endpoint port
 )
 
 // Step attributes
@@ -319,6 +321,19 @@ var (
 	attrMemoryResultCount       = attribute.Key("memory.result_count")
 	attrMemoryMessageCount      = attribute.Key("memory.message_count")
 )
+
+// Opt-in content recording attributes (GenAI semconv).
+// Gated by OTEL_GENAI_CAPTURE_CONTENT=true env var since they may contain sensitive data.
+var (
+	attrGenAISystemInstructions = attribute.Key("gen_ai.system_instructions")
+	attrGenAIToolDefinitions    = attribute.Key("gen_ai.tool.definitions")
+)
+
+// captureContent returns true when opt-in content recording is enabled.
+func captureContent() bool {
+	v := os.Getenv("OTEL_GENAI_CAPTURE_CONTENT")
+	return v == "true" || v == "1"
+}
 
 // ────────────────────────────────────────────────────────────────────
 // Span helpers
@@ -407,7 +422,7 @@ func setLLMResultAttributes(span trace.Span, result *fantasy.AgentResult, model 
 		}
 	}
 	if len(finishReasons) > 0 {
-		attrs = append(attrs, attrGenAIFinishReason.String(strings.Join(finishReasons, ",")))
+		attrs = append(attrs, attribute.StringSlice(string(attrGenAIFinishReason), finishReasons))
 	}
 
 	span.SetAttributes(attrs...)
@@ -493,6 +508,31 @@ func recordToolCallEventsFromSteps(span trace.Span, steps []fantasy.StepResult) 
 			results[tr.ToolCallID] = res
 		}
 
+		// Record gen_ai.assistant.message event for intermediate steps with tool calls.
+		// This captures the assistant's reasoning/text before tool invocations.
+		var hasToolCalls bool
+		var assistantText string
+		for _, content := range step.Content {
+			switch content.GetType() {
+			case fantasy.ContentTypeToolCall:
+				hasToolCalls = true
+			case fantasy.ContentTypeText:
+				if tc, ok := fantasy.AsContentType[fantasy.TextContent](content); ok {
+					assistantText += tc.Text
+				}
+			}
+		}
+		if hasToolCalls {
+			evAttrs := []attribute.KeyValue{
+				attribute.String("gen_ai.message.role", "assistant"),
+				attribute.Int("gen_ai.message.step", stepIdx+1),
+			}
+			if assistantText != "" {
+				evAttrs = append(evAttrs, attribute.String("gen_ai.message.content", truncateContent(assistantText, maxToolEventContentLen)))
+			}
+			span.AddEvent("gen_ai.assistant.message", trace.WithAttributes(evAttrs...))
+		}
+
 		// Second pass: record tool.call events with input + output.
 		for _, content := range step.Content {
 			if content.GetType() != fantasy.ContentTypeToolCall {
@@ -509,17 +549,25 @@ func recordToolCallEventsFromSteps(span trace.Span, steps []fantasy.StepResult) 
 			}
 
 			// Include tool input (JSON args) — the deep inspection data.
+			// Uses gen_ai.tool.call.arguments semconv attribute alongside legacy tool.input.
 			if tc.Input != "" {
-				evAttrs = append(evAttrs, attribute.String("tool.input", truncateContent(tc.Input, maxToolEventContentLen)))
+				evAttrs = append(evAttrs,
+					attribute.String("tool.input", truncateContent(tc.Input, maxToolEventContentLen)),
+					attrMCPToolCallArgs.String(truncateContent(tc.Input, maxToolEventContentLen)),
+				)
 			}
 
 			// Include tool output if we have a matching result.
+			// Uses gen_ai.tool.call.result semconv attribute alongside legacy tool.output.
 			if res, ok := results[tc.ToolCallID]; ok {
 				if res.isError {
 					evAttrs = append(evAttrs, attribute.Bool("tool.error", true))
 				}
 				if res.output != "" {
-					evAttrs = append(evAttrs, attribute.String("tool.output", truncateContent(res.output, maxToolEventContentLen)))
+					evAttrs = append(evAttrs,
+						attribute.String("tool.output", truncateContent(res.output, maxToolEventContentLen)),
+						attrMCPToolCallResult.String(truncateContent(res.output, maxToolEventContentLen)),
+					)
 				}
 			}
 
@@ -582,6 +630,43 @@ func truncateContent(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "... [truncated]"
+}
+
+// recordSystemMessageEvent records the system prompt as a gen_ai.system.message event
+// on the given span, following the OTel GenAI semantic conventions.
+// When OTEL_GENAI_CAPTURE_CONTENT=true, also sets the gen_ai.system_instructions attribute.
+func recordSystemMessageEvent(span trace.Span, systemPrompt string) {
+	if systemPrompt == "" {
+		return
+	}
+	span.AddEvent("gen_ai.system.message", trace.WithAttributes(
+		attribute.String("gen_ai.message.role", "system"),
+		attribute.String("gen_ai.message.content", truncateContent(systemPrompt, maxEventContentLen)),
+	))
+	if captureContent() {
+		span.SetAttributes(attrGenAISystemInstructions.String(systemPrompt))
+	}
+}
+
+// recordToolDefinitionsAttribute sets the gen_ai.tool.definitions attribute
+// on the span when opt-in content recording is enabled. This captures the
+// tool schemas available to the model for this invocation.
+func recordToolDefinitionsAttribute(span trace.Span, tools []fantasy.AgentTool) {
+	if !captureContent() || len(tools) == 0 {
+		return
+	}
+	type toolDef struct {
+		Name string `json:"name"`
+		Desc string `json:"description,omitempty"`
+	}
+	defs := make([]toolDef, 0, len(tools))
+	for _, t := range tools {
+		info := t.Info()
+		defs = append(defs, toolDef{Name: info.Name, Desc: info.Description})
+	}
+	if data, err := json.Marshal(defs); err == nil {
+		span.SetAttributes(attrGenAIToolDefinitions.String(string(data)))
+	}
 }
 
 // recordPromptEvent records the user prompt as a gen_ai.user.message event
@@ -661,21 +746,24 @@ func agentSpanAttributes(agentName, agentNamespace, conversationID string, cfg *
 		attrs = append(attrs, attrGenAIConversationID.String(conversationID))
 	}
 
-	// server.address — LLM API endpoint host
+	// server.address + server.port — LLM API endpoint
 	if cfg != nil {
-		if addr := serverAddressFromConfig(cfg); addr != "" {
+		if addr, port := serverAddressFromConfig(cfg); addr != "" {
 			attrs = append(attrs, attrGenAIServerAddress.String(addr))
+			if port > 0 {
+				attrs = append(attrs, attrGenAIServerPort.Int(port))
+			}
 		}
 	}
 
 	return attrs
 }
 
-// serverAddressFromConfig extracts the LLM server address from the primary
-// provider's BaseURL config. Returns the host portion only.
-func serverAddressFromConfig(cfg *Config) string {
+// serverAddressFromConfig extracts the LLM server address and port from the primary
+// provider's BaseURL config. Returns the host portion and port (0 if not explicit).
+func serverAddressFromConfig(cfg *Config) (string, int) {
 	if cfg == nil {
-		return ""
+		return "", 0
 	}
 	for _, p := range cfg.Providers {
 		if p.Name == cfg.PrimaryProvider || (cfg.PrimaryProvider == "" && len(cfg.Providers) == 1) {
@@ -686,30 +774,35 @@ func serverAddressFromConfig(cfg *Config) string {
 					if slashIdx := strings.Index(host, "/"); slashIdx >= 0 {
 						host = host[:slashIdx]
 					}
-					// Strip port if present
+					// Split host:port
 					if colonIdx := strings.LastIndex(host, ":"); colonIdx >= 0 {
-						return host[:colonIdx]
+						portStr := host[colonIdx+1:]
+						host = host[:colonIdx]
+						if port, err := strconv.Atoi(portStr); err == nil {
+							return host, port
+						}
+						return host, 0
 					}
-					return host
+					return host, 0
 				}
-				return p.BaseURL
+				return p.BaseURL, 0
 			}
 			// Return well-known endpoint for the provider type
 			switch strings.ToLower(p.Type) {
 			case "anthropic":
-				return "api.anthropic.com"
+				return "api.anthropic.com", 443
 			case "openai":
-				return "api.openai.com"
+				return "api.openai.com", 443
 			case "google", "gemini":
-				return "generativelanguage.googleapis.com"
+				return "generativelanguage.googleapis.com", 443
 			case "deepseek":
-				return "api.deepseek.com"
+				return "api.deepseek.com", 443
 			case "openrouter":
-				return "openrouter.ai"
+				return "openrouter.ai", 443
 			}
 		}
 	}
-	return ""
+	return "", 0
 }
 
 type rootSpanKey struct{}

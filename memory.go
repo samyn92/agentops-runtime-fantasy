@@ -321,6 +321,8 @@ func (ec *EngramClient) FetchContext(ctx context.Context, limit int, query strin
 		attrMemoryOp.String("fetch_context"),
 		attrMemoryProject.String(ec.project),
 		attrMemoryLimit.Int(limit),
+		attribute.String("gen_ai.data_source.id", ec.project),
+		attribute.String("gen_ai.operation.name", "retrieval"),
 	)
 
 	params := url.Values{
@@ -548,6 +550,9 @@ func (ec *EngramClient) Search(ctx context.Context, query string, limit int) ([]
 		attrMemorySessionID.String(ec.sessionID),
 		attrMemorySearchQuery.String(query),
 		attrMemoryLimit.Int(limit),
+		attribute.String("gen_ai.data_source.id", ec.project),
+		attribute.String("gen_ai.operation.name", "retrieval"),
+		attribute.String("gen_ai.retrieval.query.text", query),
 	)
 
 	params := url.Values{
@@ -570,7 +575,10 @@ func (ec *EngramClient) Search(ctx context.Context, query string, limit int) ([]
 		return nil, fmt.Errorf("memory search parse: %w", err)
 	}
 
-	span.SetAttributes(attrMemoryResultCount.Int(len(results)))
+	span.SetAttributes(
+		attrMemoryResultCount.Int(len(results)),
+		attribute.Int("gen_ai.retrieval.documents.count", len(results)),
+	)
 	return results, nil
 }
 
