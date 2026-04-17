@@ -730,6 +730,39 @@ func (dw *DelegationWatcher) triggerCallback(group *DelegationGroup) {
 		"totalDuration": time.Since(group.CreatedAt).Round(time.Second).String(),
 	})
 
+	// Emit structured delegation result for rich UI rendering.
+	// Each run's full RunResult is included so the frontend can display
+	// PR links, branches, output summaries, etc. without parsing text.
+	runResults := make(map[string]any, len(group.Runs))
+	for runName, result := range group.Runs {
+		if result == nil {
+			runResults[runName] = map[string]any{"phase": "TimedOut"}
+			continue
+		}
+		runResults[runName] = map[string]any{
+			"agentName":      result.AgentName,
+			"phase":          result.Phase,
+			"output":         result.Output,
+			"toolCalls":      result.ToolCalls,
+			"model":          result.Model,
+			"traceID":        result.TraceID,
+			"duration":       result.Duration.Round(time.Second).String(),
+			"pullRequestURL": result.PullRequestURL,
+			"commits":        result.Commits,
+			"branch":         result.Branch,
+			"failureReason":  result.FailureReason,
+		}
+	}
+	dw.emitFEP("delegation.result", map[string]any{
+		"groupId":       group.ID,
+		"single":        group.Single,
+		"timedOut":      false,
+		"totalDuration": time.Since(group.CreatedAt).Round(time.Second).String(),
+		"succeeded":     succeeded,
+		"failed":        failed,
+		"runs":          runResults,
+	})
+
 	// Trigger the agent loop with results
 	if triggerFn != nil {
 		triggerFn(prompt)
@@ -778,6 +811,38 @@ func (dw *DelegationWatcher) handleTimeout(group *DelegationGroup) {
 		"groupId":   group.ID,
 		"completed": completed,
 		"timedOut":  group.Remaining,
+	})
+
+	// Emit structured delegation result (timeout variant)
+	runResults := make(map[string]any, len(group.Runs))
+	for runName, result := range group.Runs {
+		if result == nil {
+			runResults[runName] = map[string]any{"phase": "TimedOut"}
+			continue
+		}
+		runResults[runName] = map[string]any{
+			"agentName":      result.AgentName,
+			"phase":          result.Phase,
+			"output":         result.Output,
+			"toolCalls":      result.ToolCalls,
+			"model":          result.Model,
+			"traceID":        result.TraceID,
+			"duration":       result.Duration.Round(time.Second).String(),
+			"pullRequestURL": result.PullRequestURL,
+			"commits":        result.Commits,
+			"branch":         result.Branch,
+			"failureReason":  result.FailureReason,
+		}
+	}
+	succeeded, failed := countOutcomes(group)
+	dw.emitFEP("delegation.result", map[string]any{
+		"groupId":       group.ID,
+		"single":        group.Single,
+		"timedOut":      true,
+		"totalDuration": time.Since(group.CreatedAt).Round(time.Second).String(),
+		"succeeded":     succeeded,
+		"failed":        failed,
+		"runs":          runResults,
 	})
 
 	// Build partial results prompt
