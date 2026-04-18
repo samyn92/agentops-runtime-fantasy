@@ -191,6 +191,26 @@ func (e *fepEmitter) emitAgentStart(sessionId, prompt string, traceID string, bu
 	e.emit("agent_start", fields)
 }
 
+// emitAgentStartInternal emits agent_start for synthetic prompts (e.g. delegation
+// callbacks) that should NOT be rendered as a user-authored message in the chat
+// UI. The raw prompt is deliberately omitted from the event — clients use the
+// "internal" flag to bootstrap an assistant-only bubble with a processing
+// indicator instead of a user bubble echoing the synthetic prompt text.
+func (e *fepEmitter) emitAgentStartInternal(sessionId, source, traceID string, budget *ContextBudgetSnapshot) {
+	fields := map[string]any{
+		"session_id": sessionId,
+		"internal":   true,
+		"source":     source, // e.g. "delegation_callback"
+	}
+	if traceID != "" {
+		fields["trace_id"] = traceID
+	}
+	if budget != nil {
+		fields["context_budget"] = budget
+	}
+	e.emit("agent_start", fields)
+}
+
 func (e *fepEmitter) emitAgentFinish(sessionId string, totalUsage fantasy.Usage, stepCount int, model string) {
 	e.emit("agent_finish", map[string]any{
 		"session_id":  sessionId,

@@ -1490,11 +1490,13 @@ func (s *daemonServer) handleInternalPrompt(prompt string) {
 		s.budget.UpdatePerTurn(memoryCtx, "", prompt, messages)
 	}
 
-	// Emit agent start with trace ID and context budget snapshot
+	// Emit agent start with trace ID and context budget snapshot.
+	// Use the "internal" variant so the BFF/UI doesn't render the synthetic
+	// delegation callback prompt as a user-authored chat bubble.
 	traceID := traceIDFromContext(ctx)
 	budgetSnap := s.budget.Snapshot()
 	if emit != nil {
-		emit.emitAgentStart(s.agentName, prompt, traceID, &budgetSnap)
+		emit.emitAgentStartInternal(s.agentName, "delegation_callback", traceID, &budgetSnap)
 	}
 
 	call, cbRes, cleanup := s.buildStreamCallbacks(streamCallbacksConfig{
