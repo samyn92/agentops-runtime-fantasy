@@ -87,8 +87,17 @@ func newBashTool() fantasy.AgentTool {
 				"duration": elapsed.Milliseconds(),
 			}
 
-			if err != nil {
-				result := fantasy.NewTextErrorResponse(fmt.Sprintf("%s\n%s", string(out), err.Error()))
+			// Treat any non-zero exit as a tool error, even if Go err is nil
+			// (some tools write fatal output to stderr but still exit cleanly via
+			// shell wrappers — defense in depth so trace UI colors them red).
+			if err != nil || exitCode != 0 {
+				msg := string(out)
+				if err != nil {
+					msg = fmt.Sprintf("%s\n%s", msg, err.Error())
+				} else {
+					msg = fmt.Sprintf("%s\n[exit code %d]", msg, exitCode)
+				}
+				result := fantasy.NewTextErrorResponse(msg)
 				return fantasy.WithResponseMetadata(result, metadata), nil
 			}
 			result := fantasy.NewTextResponse(string(out))

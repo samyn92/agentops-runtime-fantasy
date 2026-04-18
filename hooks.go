@@ -87,6 +87,12 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 	// Record tool input as a span event for trace visibility
 	recordToolInputEvent(span, toolName, call.Input)
 
+	// Surface a compact preview as a span attribute so the trace waterfall
+	// can label rows meaningfully (e.g. "bash: git push origin feat/...").
+	if preview := buildToolCallPreview(toolName, args); preview != "" {
+		span.SetAttributes(attribute.String("tool.preview", preview))
+	}
+
 	// Before: blocked commands — save violation to memory
 	if h.hooks != nil && toolName == "bash" && len(h.hooks.BlockedCommands) > 0 {
 		cmd, _ := args["command"].(string)
@@ -210,6 +216,12 @@ func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fanta
 			attribute.String("tool.name", toolName),
 			attribute.String("tool.type", classifyToolType(toolName)),
 			attribute.Int64("tool.duration_ms", elapsed.Milliseconds()),
+		}
+		// Compact preview of the call: for bash, the command; for other tools,
+		// the first scalar arg. Lets the trace UI render meaningful row labels
+		// without parsing tool.input from a separate event.
+		if preview := buildToolCallPreview(toolName, args); preview != "" {
+			evAttrs = append(evAttrs, attribute.String("tool.preview", preview))
 		}
 		if err != nil || result.IsError {
 			evAttrs = append(evAttrs, attribute.Bool("tool.error", true))
@@ -438,4 +450,29 @@ func truncateForHook(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// buildToolCallPreview returns a compact, human-readable preview of a tool
+// invocation, suitable for trace waterfall labels. Picks the most informative
+// scalar argument per tool family. Capped at ~80 chars on a single line.
+func buildToolCallPreview(toolName string, args map[string]any) string {
+	if args == nil {
+		return ""
+	}
+	// Pick the best argument by tool family
+	candidates := []string{"command", "path", "pattern", "url", "query", "branch", "message", "name"}
+	var picked string
+	for _, k := range candidates {
+		if v, ok := args[k].(string); ok && v != "" {
+			picked = v
+			break
+		}
+	}
+	if picked == "" {
+		return ""
+	}
+	// Single-line, truncated
+	picked = strings.ReplaceAll(picked, "\n", " ")
+	picked = strings.ReplaceAll(picked, "\t", " ")
+	return truncateForHook(picked, 80)
 }
