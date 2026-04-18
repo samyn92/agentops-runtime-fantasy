@@ -159,6 +159,14 @@ func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, in
 		slog.Info("delegation tools disabled (no team configured)")
 	}
 
+	// Add run_finish (outcome declaration) — available to all agents whenever
+	// the K8s client is reachable. Task agents typically call this once before
+	// exiting; daemon agents may call it per-turn for chat outcomes.
+	if k8sClient != nil {
+		tools = append(tools, newRunFinishTool(k8sClient))
+		slog.Info("run_finish tool enabled")
+	}
+
 	// Add any extra tools (e.g. memory tools from Engram)
 	tools = append(tools, extraTools...)
 
@@ -1897,17 +1905,18 @@ func (s *daemonServer) handleMemoryExtract(w http.ResponseWriter, r *http.Reques
 // ====================================================================
 
 type taskResult struct {
-	Output         string `json:"output"`
-	Steps          int    `json:"steps"`
-	Model          string `json:"model"`
-	Success        bool   `json:"success"`
-	Error          string `json:"error,omitempty"`
-	TraceID        string `json:"traceID,omitempty"`
-	InputTokens    int64  `json:"inputTokens,omitempty"`
-	OutputTokens   int64  `json:"outputTokens,omitempty"`
-	PullRequestURL string `json:"pullRequestURL,omitempty"`
-	Commits        int    `json:"commits,omitempty"`
-	Branch         string `json:"branch,omitempty"`
+	Output       string `json:"output"`
+	Steps        int    `json:"steps"`
+	Model        string `json:"model"`
+	Success      bool   `json:"success"`
+	Error        string `json:"error,omitempty"`
+	TraceID      string `json:"traceID,omitempty"`
+	InputTokens  int64  `json:"inputTokens,omitempty"`
+	OutputTokens int64  `json:"outputTokens,omitempty"`
+	// NOTE: PR/branch/commits no longer travel via termination log.
+	// The runtime patches status.outcome.artifacts directly via the K8s API
+	// (PatchAgentRunOutcome) at end-of-task, with the run_finish built-in
+	// tool as the explicit override path for agents.
 }
 
 func runTask() error {
@@ -1992,7 +2001,7 @@ func runTask() error {
 		if err := setupGitWorkspace(repoURL, gitBranch, os.Getenv("GIT_BASE_BRANCH")); err != nil {
 			recordError(promptSpan, err)
 			promptSpan.End()
-			result := taskResult{Success: false, Error: fmt.Sprintf("git workspace setup failed: %v", err), Branch: gitBranch, TraceID: traceIDFromContext(ctx)}
+			result := taskResult{Success: false, Error: fmt.Sprintf("git workspace setup failed: %v", err), TraceID: traceIDFromContext(ctx)}
 			writeTaskResult(result)
 			return err
 		}
@@ -2078,7 +2087,6 @@ func runTask() error {
 		TraceID:      traceID,
 		InputTokens:  agentResult.TotalUsage.InputTokens,
 		OutputTokens: agentResult.TotalUsage.OutputTokens,
-		Branch:       gitBranch,
 	}
 
 	// Set final attributes on root span
@@ -2089,11 +2097,12 @@ func runTask() error {
 		attribute.Int("agent.steps", len(agentResult.Steps)),
 	)
 
-	// Extract git info from the agent's output if this was a git workspace run
-	if os.Getenv("GIT_REPO_URL") != "" {
-		result.Commits, _ = extractGitInfo()
-		result.PullRequestURL = extractPullRequestURL(agentResult.Steps)
-	}
+	// Auto-write status.outcome from inferred signals if the agent didn't
+	// already call run_finish itself. This gives every task a baseline
+	// outcome even before agents start using the tool explicitly. Best-effort:
+	// k8s client construction failures degrade silently (no outcome written).
+	taskK8s, _ := NewK8sClient()
+	autoFinalizeOutcome(ctx, taskK8s, agentResult.Steps, gitBranch, output)
 
 	// End memory session with raw messages (fixes session leak in task mode).
 	if engram != nil {
@@ -2346,7 +2355,7 @@ type getAgentRunInput struct {
 
 func newGetAgentRunTool(k8s *K8sClient) fantasy.AgentTool {
 	return fantasy.NewAgentTool("get_agent_run",
-		"Check the status and output of an AgentRun. Returns phase, output, model, tool call count, and git info (PR URL, commits, branch) if applicable.",
+		"Check the status and output of an AgentRun. Returns phase, output, model, tool call count, and the structured outcome (intent, summary, artifacts) when the run has completed.",
 		func(ctx context.Context, input getAgentRunInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if input.Name == "" {
 				return fantasy.NewTextErrorResponse("name is required"), nil
@@ -2368,15 +2377,31 @@ func newGetAgentRunTool(k8s *K8sClient) fantasy.AgentTool {
 				text += fmt.Sprintf("\nOutput: %s", status.Output)
 			}
 
-			// Git-specific status
-			if status.PullRequestURL != "" {
-				text += fmt.Sprintf("\nPull Request: %s", status.PullRequestURL)
-			}
-			if status.Commits > 0 {
-				text += fmt.Sprintf("\nCommits: %d", status.Commits)
-			}
-			if status.Branch != "" {
-				text += fmt.Sprintf("\nBranch: %s", status.Branch)
+			// Outcome (intent + artifacts + summary). Replaces legacy
+			// PullRequestURL/Commits/Branch flat fields.
+			if status.Outcome != nil {
+				if status.Outcome.Intent != "" {
+					text += fmt.Sprintf("\nIntent: %s", status.Outcome.Intent)
+				}
+				if status.Outcome.Summary != "" {
+					text += fmt.Sprintf("\nSummary: %s", status.Outcome.Summary)
+				}
+				for _, a := range status.Outcome.Artifacts {
+					line := fmt.Sprintf("\nArtifact: %s", a.Kind)
+					if a.Provider != "" {
+						line += fmt.Sprintf(" (%s)", a.Provider)
+					}
+					if a.URL != "" {
+						line += " " + a.URL
+					}
+					if a.Ref != "" {
+						line += " [" + a.Ref + "]"
+					}
+					if a.Title != "" {
+						line += " — " + a.Title
+					}
+					text += line
+				}
 			}
 
 			// Hint if still running
@@ -2390,11 +2415,8 @@ func newGetAgentRunTool(k8s *K8sClient) fantasy.AgentTool {
 				"phase":  status.Phase,
 				"output": status.Output,
 			}
-			if status.PullRequestURL != "" {
-				metadata["pullRequestURL"] = status.PullRequestURL
-			}
-			if status.Branch != "" {
-				metadata["branch"] = status.Branch
+			if status.Outcome != nil {
+				metadata["outcome"] = outcomeToFEPMap(status.Outcome)
 			}
 
 			resp := fantasy.NewTextResponse(text)

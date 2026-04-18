@@ -333,17 +333,15 @@ type DelegationRun struct {
 
 // RunResult holds the outcome of a completed child run.
 type RunResult struct {
-	AgentName      string        `json:"agentName"`
-	Phase          string        `json:"phase"`
-	Output         string        `json:"output"`
-	ToolCalls      int64         `json:"toolCalls"`
-	Model          string        `json:"model"`
-	TraceID        string        `json:"traceID,omitempty"`
-	Duration       time.Duration `json:"duration"`
-	PullRequestURL string        `json:"pullRequestURL,omitempty"`
-	Commits        int64         `json:"commits,omitempty"`
-	Branch         string        `json:"branch,omitempty"`
-	FailureReason  string        `json:"failureReason,omitempty"`
+	AgentName     string           `json:"agentName"`
+	Phase         string           `json:"phase"`
+	Output        string           `json:"output"`
+	ToolCalls     int64            `json:"toolCalls"`
+	Model         string           `json:"model"`
+	TraceID       string           `json:"traceID,omitempty"`
+	Duration      time.Duration    `json:"duration"`
+	Outcome       *AgentRunOutcome `json:"outcome,omitempty"`
+	FailureReason string           `json:"failureReason,omitempty"`
 }
 
 // DelegationGroup tracks a set of parallel AgentRuns.
@@ -740,17 +738,15 @@ func (dw *DelegationWatcher) triggerCallback(group *DelegationGroup) {
 			continue
 		}
 		runResults[runName] = map[string]any{
-			"agentName":      result.AgentName,
-			"phase":          result.Phase,
-			"output":         result.Output,
-			"toolCalls":      result.ToolCalls,
-			"model":          result.Model,
-			"traceID":        result.TraceID,
-			"duration":       result.Duration.Round(time.Second).String(),
-			"pullRequestURL": result.PullRequestURL,
-			"commits":        result.Commits,
-			"branch":         result.Branch,
-			"failureReason":  result.FailureReason,
+			"agentName":     result.AgentName,
+			"phase":         result.Phase,
+			"output":        result.Output,
+			"toolCalls":     result.ToolCalls,
+			"model":         result.Model,
+			"traceID":       result.TraceID,
+			"duration":      result.Duration.Round(time.Second).String(),
+			"outcome":       outcomeToFEPMap(result.Outcome),
+			"failureReason": result.FailureReason,
 		}
 	}
 	dw.emitFEP("delegation.result", map[string]any{
@@ -821,17 +817,15 @@ func (dw *DelegationWatcher) handleTimeout(group *DelegationGroup) {
 			continue
 		}
 		runResults[runName] = map[string]any{
-			"agentName":      result.AgentName,
-			"phase":          result.Phase,
-			"output":         result.Output,
-			"toolCalls":      result.ToolCalls,
-			"model":          result.Model,
-			"traceID":        result.TraceID,
-			"duration":       result.Duration.Round(time.Second).String(),
-			"pullRequestURL": result.PullRequestURL,
-			"commits":        result.Commits,
-			"branch":         result.Branch,
-			"failureReason":  result.FailureReason,
+			"agentName":     result.AgentName,
+			"phase":         result.Phase,
+			"output":        result.Output,
+			"toolCalls":     result.ToolCalls,
+			"model":         result.Model,
+			"traceID":       result.TraceID,
+			"duration":      result.Duration.Round(time.Second).String(),
+			"outcome":       outcomeToFEPMap(result.Outcome),
+			"failureReason": result.FailureReason,
 		}
 	}
 	succeeded, failed := countOutcomes(group)
@@ -904,9 +898,7 @@ func extractRunStatus(obj map[string]interface{}, runName string) *RunResult {
 			result.ToolCalls = rs.ToolCalls
 			result.Model = rs.Model
 			result.TraceID = rs.TraceID
-			result.PullRequestURL = rs.PullRequestURL
-			result.Commits = rs.Commits
-			result.Branch = rs.Branch
+			result.Outcome = rs.Outcome
 		}
 	}
 
@@ -945,12 +937,7 @@ func buildCallbackPrompt(group *DelegationGroup, timedOut bool) string {
 						b.WriteString(fmt.Sprintf(" (%s)", result.Duration.Round(time.Second)))
 					}
 					b.WriteString("\n")
-					if result.PullRequestURL != "" {
-						b.WriteString(fmt.Sprintf("  PR: %s\n", result.PullRequestURL))
-					}
-					if result.Branch != "" {
-						b.WriteString(fmt.Sprintf("  Branch: %s (commits: %d)\n", result.Branch, result.Commits))
-					}
+					writeOutcomeLines(&b, result.Outcome, "  ")
 					if result.ToolCalls > 0 {
 						b.WriteString(fmt.Sprintf("  Tool calls: %d, Model: %s\n", result.ToolCalls, result.Model))
 					}
@@ -995,12 +982,7 @@ func buildCallbackPrompt(group *DelegationGroup, timedOut bool) string {
 		}
 		b.WriteString("\n")
 
-		if result.PullRequestURL != "" {
-			b.WriteString(fmt.Sprintf("     PR: %s\n", result.PullRequestURL))
-		}
-		if result.Branch != "" {
-			b.WriteString(fmt.Sprintf("     Branch: %s (commits: %d)\n", result.Branch, result.Commits))
-		}
+		writeOutcomeLines(&b, result.Outcome, "     ")
 		if result.ToolCalls > 0 {
 			b.WriteString(fmt.Sprintf("     Tool calls: %d, Model: %s\n", result.ToolCalls, result.Model))
 		}

@@ -19,6 +19,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
@@ -272,16 +273,32 @@ type AgentRunGitParams struct {
 	BaseBranch  string `json:"baseBranch,omitempty"`
 }
 
+// AgentRunArtifact mirrors agents.agentops.io/v1alpha1.AgentRunArtifact.
+type AgentRunArtifact struct {
+	// Kind: pr | mr | issue | memory | commit
+	Kind     string `json:"kind"`
+	Provider string `json:"provider,omitempty"`
+	URL      string `json:"url,omitempty"`
+	Ref      string `json:"ref,omitempty"`
+	Title    string `json:"title,omitempty"`
+}
+
+// AgentRunOutcome mirrors agents.agentops.io/v1alpha1.AgentRunOutcomeStatus.
+type AgentRunOutcome struct {
+	// Intent: change | plan | incident | discovery | noop
+	Intent    string             `json:"intent,omitempty"`
+	Artifacts []AgentRunArtifact `json:"artifacts,omitempty"`
+	Summary   string             `json:"summary,omitempty"`
+}
+
 // AgentRunStatus holds the status of an AgentRun.
 type AgentRunStatus struct {
-	Phase          string `json:"phase"`
-	Output         string `json:"output"`
-	ToolCalls      int64  `json:"toolCalls"`
-	Model          string `json:"model"`
-	TraceID        string `json:"traceID,omitempty"`
-	PullRequestURL string `json:"pullRequestURL,omitempty"`
-	Commits        int64  `json:"commits,omitempty"`
-	Branch         string `json:"branch,omitempty"`
+	Phase     string           `json:"phase"`
+	Output    string           `json:"output"`
+	ToolCalls int64            `json:"toolCalls"`
+	Model     string           `json:"model"`
+	TraceID   string           `json:"traceID,omitempty"`
+	Outcome   *AgentRunOutcome `json:"outcome,omitempty"`
 }
 
 // CreateAgentRun creates an AgentRun CR. If gitParams is non-nil, spec.git is populated.
@@ -372,6 +389,67 @@ func (k *K8sClient) GetAgentRun(ctx context.Context, name string) (*AgentRunStat
 	json.Unmarshal(data, &result)
 
 	return &result, nil
+}
+
+// PatchAgentRunOutcome merge-patches status.outcome on the given AgentRun.
+// Used by the run_finish built-in tool. The patch only touches status.outcome
+// so it composes safely with the operator's other status writes (phase, etc.).
+//
+// This is the runtime's authoritative path for writing the run outcome.
+// Requires the agent's Role to grant `patch` on `agentruns/status`
+// (granted by agentops-core's BuildAgentRole since the AgentRunOutcomeSpec
+// proposal landed).
+func (k *K8sClient) PatchAgentRunOutcome(ctx context.Context, name string, outcome AgentRunOutcome) error {
+	patch := map[string]interface{}{
+		"status": map[string]interface{}{
+			"outcome": outcomeToUnstructured(outcome),
+		},
+	}
+	body, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("marshal outcome patch: %w", err)
+	}
+	_, err = k.client.Resource(agentRunGVR).Namespace(k.namespace).Patch(
+		ctx, name, k8stypes.MergePatchType, body, metav1.PatchOptions{}, "status",
+	)
+	if err != nil {
+		return fmt.Errorf("patch AgentRun %s status.outcome: %w", name, err)
+	}
+	return nil
+}
+
+// outcomeToUnstructured converts an AgentRunOutcome to the map shape the
+// dynamic client expects. Empty fields are omitted so a partial patch
+// doesn't blank out fields it doesn't intend to touch.
+func outcomeToUnstructured(o AgentRunOutcome) map[string]interface{} {
+	m := map[string]interface{}{}
+	if o.Intent != "" {
+		m["intent"] = o.Intent
+	}
+	if o.Summary != "" {
+		m["summary"] = o.Summary
+	}
+	if len(o.Artifacts) > 0 {
+		arts := make([]interface{}, 0, len(o.Artifacts))
+		for _, a := range o.Artifacts {
+			am := map[string]interface{}{"kind": a.Kind}
+			if a.Provider != "" {
+				am["provider"] = a.Provider
+			}
+			if a.URL != "" {
+				am["url"] = a.URL
+			}
+			if a.Ref != "" {
+				am["ref"] = a.Ref
+			}
+			if a.Title != "" {
+				am["title"] = a.Title
+			}
+			arts = append(arts, am)
+		}
+		m["artifacts"] = arts
+	}
+	return m
 }
 
 // WatchAgentRun starts a Kubernetes Watch on a specific AgentRun CR.
