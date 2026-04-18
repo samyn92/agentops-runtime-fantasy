@@ -66,7 +66,18 @@ type tracingFuncs struct {
 //
 // When OTEL_EXPORTER_OTLP_ENDPOINT is empty, returns no-op functions
 // and uses the global no-op tracer — zero overhead in non-instrumented deployments.
+// otelErrorHandler logs OTEL internal errors (exporter dial failures, batch
+// drops, etc.) via slog so they are not silently swallowed.
+type otelErrorHandler struct{}
+
+func (otelErrorHandler) Handle(err error) {
+	slog.Error("otel internal error", "error", err)
+}
+
 func initTracing(ctx context.Context, agentName, agentNamespace, agentMode string) (*tracingFuncs, error) {
+	// Surface OTEL exporter / SDK errors that would otherwise be swallowed.
+	otel.SetErrorHandler(otelErrorHandler{})
+
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 	if endpoint == "" {
 		// No endpoint configured — use no-op tracer and metrics
@@ -156,6 +167,27 @@ func initTracing(ctx context.Context, agentName, agentNamespace, agentMode strin
 		"agent", agentName,
 		"mode", agentMode,
 	)
+
+	// Heartbeat span: emit a startup span and ForceFlush so export issues
+	// surface immediately in logs (via otelErrorHandler) rather than after
+	// the first long-running delegation. Visible in Tempo as
+	// span.name="runtime.startup" under service.name="agentops-runtime".
+	go func() {
+		hbCtx, hbSpan := tp.Tracer("agentops-runtime").Start(context.Background(), "runtime.startup",
+			trace.WithAttributes(
+				attribute.String("agent.name", agentName),
+				attribute.String("agent.mode", agentMode),
+			),
+		)
+		hbSpan.End()
+		flushCtx, cancel := context.WithTimeout(hbCtx, 5*time.Second)
+		defer cancel()
+		if err := tp.ForceFlush(flushCtx); err != nil {
+			slog.Error("otel startup flush failed", "error", err)
+		} else {
+			slog.Info("otel startup heartbeat flushed", "endpoint", endpoint)
+		}
+	}()
 
 	return &tracingFuncs{ForceFlush: tp.ForceFlush, Shutdown: tp.Shutdown}, nil
 }
