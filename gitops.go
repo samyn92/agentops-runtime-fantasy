@@ -37,6 +37,65 @@ type gitWorkspace struct {
 // Global workspace — set by setupGitWorkspace, used by git tools.
 var workspace *gitWorkspace
 
+// augmentSystemPromptWithGitContext appends a workspace context block to
+// the system prompt when GIT_REPO_URL is set (i.e. the operator has provisioned
+// a git workspace for this run).
+//
+// Why this exists:
+// Without this hint, agents commonly invent paths like /tmp/<repo> via bash
+// `git clone` and then call MCP `git_*` tools with cwd="/tmp/<repo>". Those
+// tools sandbox to /data and reject anything else, so the agent ends up
+// thrashing between bash git (which often fails on author identity / push
+// auth) and rejected MCP calls.
+//
+// The block tells the LLM, in its system prompt, exactly:
+//   - where the repo is pre-cloned (/data/repo)
+//   - which branch it's on
+//   - to prefer MCP `git_*` and `github_*`/`gitlab_*` tools over bash git
+//   - that omitting `cwd` is the safest default
+//
+// Returns the prompt unchanged when GIT_REPO_URL is not set, so this is
+// safe to call unconditionally.
+func augmentSystemPromptWithGitContext(prompt string) string {
+	repoURL := os.Getenv("GIT_REPO_URL")
+	if repoURL == "" {
+		return prompt
+	}
+
+	branch := os.Getenv("GIT_BRANCH")
+	baseBranch := os.Getenv("GIT_BASE_BRANCH")
+	provider := os.Getenv("GIT_PROVIDER")
+
+	var b strings.Builder
+	if prompt != "" {
+		b.WriteString(prompt)
+		b.WriteString("\n\n")
+	}
+	b.WriteString("## Git Workspace\n\n")
+	b.WriteString(fmt.Sprintf("A git workspace is pre-cloned for you at `/data/repo`.\n"))
+	b.WriteString(fmt.Sprintf("- Repository: `%s`\n", repoURL))
+	if branch != "" {
+		b.WriteString(fmt.Sprintf("- Working branch: `%s` (already checked out)\n", branch))
+	}
+	if baseBranch != "" {
+		b.WriteString(fmt.Sprintf("- Base branch: `%s`\n", baseBranch))
+	}
+	b.WriteString("\n### Tool guidance\n\n")
+	b.WriteString("- **Use MCP `git_*` tools** (e.g. `git_status`, `git_add`, `git_commit`, `git_push`) — NOT bash `git`. ")
+	b.WriteString("Bash git lacks committer identity and credential helpers in this sandbox; the MCP tools handle both.\n")
+	b.WriteString("- **Omit the `cwd` parameter** on MCP git tools. It defaults to the workspace root (`/data`), and the repo is at `/data/repo`. ")
+	b.WriteString("Passing absolute paths outside `/data` (like `/tmp/...`) will be rejected.\n")
+	if provider == "github" {
+		b.WriteString("- **Use MCP `github_*` tools** to create pull requests, comment, etc. — NOT `gh` CLI via bash. ")
+		b.WriteString("`GH_TOKEN` is wired into the MCP server, not into bash subprocesses.\n")
+	} else if provider == "gitlab" {
+		b.WriteString("- **Use MCP `gitlab_*` tools** to create merge requests, comment, etc. — NOT `glab` CLI via bash. ")
+		b.WriteString("`GITLAB_TOKEN` is wired into the MCP server, not into bash subprocesses.\n")
+	}
+	b.WriteString("- Do not `git clone` again — the repo is already cloned and on the right branch.\n")
+	return b.String()
+}
+
 // setupGitWorkspace clones a repo and checks out the feature branch using go-git.
 func setupGitWorkspace(repoURL, branch, baseBranch string) error {
 	repoDir := "/data/repo"

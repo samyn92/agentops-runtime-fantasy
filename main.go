@@ -434,6 +434,10 @@ func runDaemon() error {
 		return err
 	}
 
+	// Mirror the task-mode augmentation so daemon agents (chat sessions)
+	// also get git workspace context when GIT_REPO_URL is set.
+	cfg.SystemPrompt = augmentSystemPromptWithGitContext(cfg.SystemPrompt)
+
 	slog.Info("starting Fantasy daemon agent",
 		"model", cfg.PrimaryModel,
 		"providers", len(cfg.Providers),
@@ -1935,6 +1939,12 @@ func runTask() error {
 		writeTaskResult(result)
 		return err
 	}
+
+	// Augment system prompt with git workspace context so the agent knows
+	// where its repo lives and which tools to use. Without this, agents
+	// commonly clone into /tmp/<repo> via bash and then fail when MCP git
+	// tools (sandboxed to /data) reject those out-of-sandbox paths.
+	cfg.SystemPrompt = augmentSystemPromptWithGitContext(cfg.SystemPrompt)
 
 	// Initialize OpenTelemetry tracing
 	agentName := os.Getenv("AGENT_NAME")
