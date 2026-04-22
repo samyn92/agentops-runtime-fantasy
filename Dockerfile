@@ -2,12 +2,14 @@
 # Two modes: daemon (HTTP server) and task (one-shot)
 
 FROM golang:1.26 AS builder
+ARG TARGETOS
+ARG TARGETARCH
 ARG VERSION=dev
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY *.go ./
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.version=${VERSION}" -o agent-runtime .
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -ldflags="-s -w -X main.version=${VERSION}" -o agent-runtime .
 
 FROM alpine:3.20
 # Install minimal tools needed by built-in tools
