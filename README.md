@@ -530,7 +530,7 @@ CGO_ENABLED=0 go build -o agentops-runtime .
 docker build -t agentops-runtime .
 ```
 
-The image is based on `alpine:3.21` with `bash`, `curl`, and `ripgrep` installed for the built-in tools. Runs as non-root user `1000:1000`. Creates `/data/sessions`, `/data/repos`, `/data/scratch` directories.
+The image is based on `alpine:3.20` with `bash`, `curl`, `ripgrep`, and `git` installed for the built-in tools. Runs as non-root user `65532:65532` (the distroless `nonroot` UID, matching every other operator-built image). Creates `/data/sessions`, `/data/repos`, `/data/scratch` directories.
 
 ### Published Images
 

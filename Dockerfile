@@ -16,11 +16,14 @@ FROM alpine:3.20
 RUN apk add --no-cache bash curl ripgrep git
 COPY --from=builder /app/agent-runtime /app/agent-runtime
 
-# Create data directories
-RUN mkdir -p /data/sessions /data/repos /data/scratch \
-    && chown -R 1000:1000 /data
+# Create non-root user matching the operator's RestrictedRunAsUser
+# (65532 is the distroless `nonroot` UID — used by every other operator-built image).
+RUN addgroup -g 65532 -S nonroot \
+    && adduser -u 65532 -S nonroot -G nonroot -H -h /home/nonroot \
+    && mkdir -p /data/sessions /data/repos /data/scratch /home/nonroot \
+    && chown -R 65532:65532 /data /home/nonroot
 
-USER 1000:1000
+USER 65532:65532
 
 ENTRYPOINT ["/app/agent-runtime"]
 CMD ["daemon"]
