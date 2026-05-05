@@ -27,7 +27,7 @@ import (
 func resolveProvider(entry ProviderEntry) (fantasy.Provider, error) {
 	envKey := fmt.Sprintf("%s_API_KEY", strings.ToUpper(entry.Name))
 	apiKey := os.Getenv(envKey)
-	if apiKey == "" {
+	if apiKey == "" && !isProxied(entry) {
 		return nil, fmt.Errorf("no API key for provider %s (env: %s)", entry.Name, envKey)
 	}
 
@@ -54,6 +54,14 @@ func resolveProvider(entry ProviderEntry) (fantasy.Provider, error) {
 // --------------------------------------------------------------------
 // Type-based provider constructors
 // --------------------------------------------------------------------
+
+// isProxied reports whether the provider's baseURL points at a local
+// sidecar proxy (e.g. token-injector). In that case no API key is needed
+// because the proxy injects auth headers on the wire.
+func isProxied(entry ProviderEntry) bool {
+	return strings.HasPrefix(entry.BaseURL, "http://localhost:") ||
+		strings.HasPrefix(entry.BaseURL, "http://127.0.0.1:")
+}
 
 func newAnthropicProvider(entry ProviderEntry, apiKey string) (fantasy.Provider, error) {
 	opts := []anthropic.Option{anthropic.WithAPIKey(apiKey)}
