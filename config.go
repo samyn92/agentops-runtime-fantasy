@@ -86,6 +86,19 @@ type ProviderEntry struct {
 	Vertex          *VertexEntry      `json:"vertex,omitempty"`
 	Bedrock         bool              `json:"bedrock,omitempty"`
 	CallDefaults    *CallDefaults     `json:"callDefaults,omitempty"`
+	OAuth2          *OAuth2Entry      `json:"oauth2,omitempty"`
+}
+
+// OAuth2Entry holds OAuth2 client_credentials config for token-based auth.
+// When set, the runtime fetches tokens from TokenURL and injects them as
+// Authorization: Bearer headers — replacing the token-injector sidecar.
+// ClientID and ClientSecret are read from environment variables specified
+// by ClientIDEnv and ClientSecretEnv (populated by the operator from Secret refs).
+type OAuth2Entry struct {
+	TokenURL        string   `json:"tokenURL"`
+	ClientIDEnv     string   `json:"clientIDEnv"`
+	ClientSecretEnv string   `json:"clientSecretEnv"`
+	Scopes          []string `json:"scopes,omitempty"`
 }
 
 // VertexEntry holds Vertex AI config.

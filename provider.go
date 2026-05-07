@@ -27,7 +27,7 @@ import (
 func resolveProvider(entry ProviderEntry) (fantasy.Provider, error) {
 	envKey := fmt.Sprintf("%s_API_KEY", strings.ToUpper(entry.Name))
 	apiKey := os.Getenv(envKey)
-	if apiKey == "" && !isProxied(entry) {
+	if apiKey == "" && !isProxied(entry) && entry.OAuth2 == nil {
 		return nil, fmt.Errorf("no API key for provider %s (env: %s)", entry.Name, envKey)
 	}
 
@@ -161,9 +161,16 @@ func newOpenAICompatProvider(entry ProviderEntry, apiKey string) (fantasy.Provid
 		return nil, fmt.Errorf("openaicompat provider %q requires baseURL", entry.Name)
 	}
 	opts := []openaicompat.Option{
-		openaicompat.WithAPIKey(apiKey),
 		openaicompat.WithBaseURL(baseURL),
 		openaicompat.WithName(entry.Name),
+	}
+	// OAuth2 token injection replaces both API key and sidecar proxy.
+	if entry.OAuth2 != nil {
+		opts = append(opts, openaicompat.WithHTTPClient(newOAuth2HTTPClient(entry.OAuth2)))
+		// Use a dummy key — the HTTP client handles auth via Bearer token.
+		opts = append(opts, openaicompat.WithAPIKey("oauth2-managed"))
+	} else {
+		opts = append(opts, openaicompat.WithAPIKey(apiKey))
 	}
 	if entry.UseResponsesAPI {
 		opts = append(opts, openaicompat.WithUseResponsesAPI())
