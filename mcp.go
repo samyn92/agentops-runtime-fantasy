@@ -22,6 +22,7 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 )
 
@@ -171,6 +172,10 @@ func startStdioMCP(ctx context.Context, name, binPath string) (*mcpConnection, e
 	}
 
 	slog.Info("started MCP stdio server", "name", name, "bin", binPath)
+	// Log server version from initialize handshake
+	if ir := session.InitializeResult(); ir != nil && ir.ServerInfo.Version != "" {
+		slog.Info("MCP server version", "name", name, "version", ir.ServerInfo.Version)
+	}
 	return &mcpConnection{
 		session: session,
 		cleanup: func() { session.Close() },
@@ -206,30 +211,38 @@ func discoverMCPTools(ctx context.Context, session *mcp.ClientSession, serverNam
 		return nil, fmt.Errorf("list tools: %w", err)
 	}
 
+	// Extract server version from the initialize handshake
+	var serverVersion string
+	if ir := session.InitializeResult(); ir != nil && ir.ServerInfo.Version != "" {
+		serverVersion = ir.ServerInfo.Version
+	}
+
 	var tools []fantasy.AgentTool
 	for _, t := range result.Tools {
-		tools = append(tools, newMCPToolAdapter(session, serverName, t, transport, crdUIHint))
+		tools = append(tools, newMCPToolAdapter(session, serverName, t, transport, crdUIHint, serverVersion))
 	}
 	return tools, nil
 }
 
 // mcpToolAdapter wraps an MCP tool as a fantasy.AgentTool.
 type mcpToolAdapter struct {
-	session    *mcp.ClientSession
-	serverName string
-	mcpTool    *mcp.Tool
-	transport  string // "stdio" (OCI/inline) or "streamable" (gateway/CRD)
-	crdUIHint  string // UI hint from the AgentTool CRD (overrides heuristic detection)
-	opts       fantasy.ProviderOptions
+	session       *mcp.ClientSession
+	serverName    string
+	serverVersion string
+	mcpTool       *mcp.Tool
+	transport     string // "stdio" (OCI/inline) or "streamable" (gateway/CRD)
+	crdUIHint     string // UI hint from the AgentTool CRD (overrides heuristic detection)
+	opts          fantasy.ProviderOptions
 }
 
-func newMCPToolAdapter(session *mcp.ClientSession, serverName string, tool *mcp.Tool, transport string, crdUIHint string) *mcpToolAdapter {
+func newMCPToolAdapter(session *mcp.ClientSession, serverName string, tool *mcp.Tool, transport string, crdUIHint string, serverVersion string) *mcpToolAdapter {
 	return &mcpToolAdapter{
-		session:    session,
-		serverName: serverName,
-		mcpTool:    tool,
-		transport:  transport,
-		crdUIHint:  crdUIHint,
+		session:       session,
+		serverName:    serverName,
+		serverVersion: serverVersion,
+		mcpTool:       tool,
+		transport:     transport,
+		crdUIHint:     crdUIHint,
 	}
 }
 
@@ -299,6 +312,9 @@ func (m *mcpToolAdapter) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 		attrMCPMethodName.String("tools/call"),
 		attrMCPProtocolVersion.String("2025-03-26"),
 	)
+	if m.serverVersion != "" {
+		span.SetAttributes(attribute.String("tool.mcp.server.version", m.serverVersion))
+	}
 
 	// Record tool input as a span event
 	if inputJSON, err := json.Marshal(args); err == nil {
@@ -334,6 +350,9 @@ func (m *mcpToolAdapter) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 		"tool":      m.mcpTool.Name,
 		"transport": m.transport,
 		"duration":  elapsed.Milliseconds(),
+	}
+	if m.serverVersion != "" {
+		metadata["version"] = m.serverVersion
 	}
 	// Add tool description from the MCP server for the frontend to render
 	if m.mcpTool.Description != "" {
