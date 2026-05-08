@@ -65,9 +65,22 @@ func (h *hookWrappedTool) SetProviderOptions(opts fantasy.ProviderOptions) {
 func (h *hookWrappedTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
 	toolName := h.inner.Info().Name
 
+	// Capture parent span context before creating child
+	parentSC := trace.SpanFromContext(ctx).SpanContext()
+
 	// Start a tracing span for this tool execution (name includes tool for readability)
 	ctx, span := tracer.Start(ctx, "tool.execute: "+toolName)
 	defer span.End()
+
+	// Diagnostic: confirm tool.execute span is created with correct parent linkage
+	sc := span.SpanContext()
+	slog.Info("tool.execute span created",
+		"tool", toolName,
+		"spanId", sc.SpanID().String(),
+		"traceId", sc.TraceID().String(),
+		"parentSpanId", parentSC.SpanID().String(),
+		"isRecording", span.IsRecording(),
+	)
 
 	// Set tool identity attributes at creation (important for sampling decisions)
 	span.SetAttributes(

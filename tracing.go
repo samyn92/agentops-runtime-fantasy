@@ -117,13 +117,25 @@ func initTracing(ctx context.Context, agentName, agentNamespace, agentMode strin
 		return nil, fmt.Errorf("create otlp exporter: %w", err)
 	}
 
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter,
-			// Shorter batch timeout for task pods — ensures spans are flushed
-			// before short-lived Jobs exit. Daemon pods benefit too since
-			// spans appear in Tempo faster.
+	// Task pods are short-lived — use SimpleSpanProcessor to export spans
+	// synchronously on End(). This eliminates the race condition where the
+	// batch exporter's async goroutine hasn't flushed tool.execute spans
+	// before the process exits (even with ForceFlush, the batch exporter can
+	// silently drop spans if its internal queue overflows or the export fails
+	// on the first attempt). Daemon pods use the batch exporter for throughput.
+	var spanProcessor sdktrace.SpanProcessor
+	if agentMode == "task" {
+		spanProcessor = sdktrace.NewSimpleSpanProcessor(exporter)
+		slog.Info("using simple (sync) span processor for task mode")
+	} else {
+		spanProcessor = sdktrace.NewBatchSpanProcessor(exporter,
+			// Shorter batch timeout for daemon pods — spans appear in Tempo faster.
 			sdktrace.WithBatchTimeout(2*time.Second),
-		),
+		)
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSpanProcessor(spanProcessor),
 		sdktrace.WithResource(res),
 		// Always sample — we want every agent execution traced.
 		// Revisit if Tempo storage becomes a concern (per PLAN_otel.md open question #3).

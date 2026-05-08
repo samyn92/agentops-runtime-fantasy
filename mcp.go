@@ -4,7 +4,7 @@ Agent Runtime — Fantasy (Go)
 MCP tool loading: starts OCI-packaged MCP servers as subprocesses
 and wraps their tools as fantasy.AgentTool via the MCP protocol.
 
-Also loads tools from MCP gateway sidecars (shared MCPServers).
+All tools are OCI-packaged MCP servers started as stdio subprocesses.
 */
 package main
 
@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,71 +91,6 @@ func loadOCITools(ctx context.Context, toolRefs []ToolEntry) ([]fantasy.AgentToo
 	return tools, conns, nil
 }
 
-// loadGatewayMCPTools connects to MCP gateway sidecars and discovers tools.
-// Retries with backoff to handle sidecar startup race conditions.
-func loadGatewayMCPTools(ctx context.Context, mcpServers []MCPEntry) ([]fantasy.AgentTool, []mcpConnection, error) {
-	var tools []fantasy.AgentTool
-	var conns []mcpConnection
-
-	for _, srv := range mcpServers {
-		mcpURL := fmt.Sprintf("http://localhost:%d/mcp", srv.Port)
-
-		// Wait for the gateway to be ready before connecting.
-		if err := waitForGateway(ctx, srv.Port, 15*time.Second); err != nil {
-			slog.Error("MCP gateway not ready, skipping", "server", srv.Name, "port", srv.Port, "error", err)
-			continue
-		}
-
-		conn, err := startStreamableMCP(ctx, srv.Name, mcpURL)
-		if err != nil {
-			slog.Error("failed to connect to MCP gateway", "server", srv.Name, "error", err)
-			continue
-		}
-		conns = append(conns, *conn)
-
-		mcpTools, err := discoverMCPTools(ctx, conn.session, srv.Name, "streamable", srv.UIHint)
-		if err != nil {
-			slog.Error("failed to discover MCP tools from gateway", "server", srv.Name, "error", err)
-			continue
-		}
-
-		tools = append(tools, mcpTools...)
-		slog.Info("loaded MCP tools from gateway", "server", srv.Name, "count", len(mcpTools))
-	}
-
-	return tools, conns, nil
-}
-
-// waitForGateway polls the gateway health endpoint until it responds or timeout.
-func waitForGateway(ctx context.Context, port int, timeout time.Duration) error {
-	healthURL := fmt.Sprintf("http://localhost:%d/health", port)
-	deadline := time.Now().Add(timeout)
-	client := &http.Client{Timeout: 2 * time.Second}
-	attempt := 0
-
-	for time.Now().Before(deadline) {
-		attempt++
-		req, err := http.NewRequestWithContext(ctx, "GET", healthURL, nil)
-		if err != nil {
-			return err
-		}
-		resp, err := client.Do(req)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				slog.Info("MCP gateway ready", "port", port, "attempts", attempt)
-				return nil
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
-	return fmt.Errorf("gateway on port %d not ready after %s", port, timeout)
-}
-
 // startStdioMCP starts an MCP server process and connects via stdio.
 func startStdioMCP(ctx context.Context, name, binPath string) (*mcpConnection, error) {
 	impl := &mcp.Implementation{Name: "agentops-fantasy", Version: version}
@@ -176,28 +110,6 @@ func startStdioMCP(ctx context.Context, name, binPath string) (*mcpConnection, e
 	if ir := session.InitializeResult(); ir != nil && ir.ServerInfo.Version != "" {
 		slog.Info("MCP server version", "name", name, "version", ir.ServerInfo.Version)
 	}
-	return &mcpConnection{
-		session: session,
-		cleanup: func() { session.Close() },
-	}, nil
-}
-
-// startStreamableMCP connects to an MCP server via Streamable HTTP transport.
-func startStreamableMCP(ctx context.Context, name, mcpURL string) (*mcpConnection, error) {
-	impl := &mcp.Implementation{Name: "agentops-fantasy", Version: version}
-	client := mcp.NewClient(impl, nil)
-
-	transport := &mcp.StreamableClientTransport{
-		Endpoint:             mcpURL,
-		DisableStandaloneSSE: true, // we only need request/response, no server-initiated messages
-	}
-
-	session, err := client.Connect(ctx, transport, nil)
-	if err != nil {
-		return nil, fmt.Errorf("connect to MCP gateway: %w", err)
-	}
-
-	slog.Info("connected to MCP gateway", "name", name, "url", mcpURL)
 	return &mcpConnection{
 		session: session,
 		cleanup: func() { session.Close() },
@@ -230,8 +142,8 @@ type mcpToolAdapter struct {
 	serverName    string
 	serverVersion string
 	mcpTool       *mcp.Tool
-	transport     string // "stdio" (OCI/inline) or "streamable" (gateway/CRD)
-	crdUIHint     string // UI hint from the AgentTool CRD (overrides heuristic detection)
+	transport     string // "stdio" (OCI/inline)
+	crdUIHint     string // UI hint from the Agent spec (overrides heuristic detection)
 	opts          fantasy.ProviderOptions
 }
 

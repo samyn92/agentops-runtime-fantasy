@@ -18,7 +18,6 @@ type Config struct {
 	PlatformProtocol string          `json:"platformProtocol,omitempty"` // identity + delegation + memory protocol (separate from user prompt)
 	BuiltinTools     []string        `json:"builtinTools"`
 	Tools            []ToolEntry     `json:"tools"`
-	MCPServers       []MCPEntry      `json:"mcpServers,omitempty"`
 	ToolHooks        *ToolHooksEntry `json:"toolHooks,omitempty"`
 	ContextFiles     []ContextEntry  `json:"contextFiles,omitempty"`
 	Resources        []ResourceEntry `json:"resources,omitempty"`
@@ -147,16 +146,6 @@ type ToolEntry struct {
 	Description string `json:"description,omitempty"`
 	Category    string `json:"category,omitempty"`
 	UIHint      string `json:"uiHint,omitempty"`
-}
-
-// MCPEntry describes an MCP server binding (via gateway sidecar).
-type MCPEntry struct {
-	Name        string   `json:"name"`
-	Port        int      `json:"port"`
-	DirectTools []string `json:"directTools,omitempty"`
-	Description string   `json:"description,omitempty"`
-	Category    string   `json:"category,omitempty"`
-	UIHint      string   `json:"uiHint,omitempty"`
 }
 
 // ToolHooksEntry holds runtime hook config.

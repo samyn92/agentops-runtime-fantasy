@@ -126,16 +126,6 @@ func buildAgentBundle(ctx context.Context, cfg *Config, engram *EngramClient, in
 		allMCPConns = append(allMCPConns, conns...)
 	}
 
-	// Load MCP tools from gateway sidecars
-	if len(cfg.MCPServers) > 0 {
-		gwTools, conns, err := loadGatewayMCPTools(ctx, cfg.MCPServers)
-		if err != nil {
-			slog.Warn("failed to load some gateway MCP tools", "error", err)
-		}
-		tools = append(tools, gwTools...)
-		allMCPConns = append(allMCPConns, conns...)
-	}
-
 	// Add built-in git tools when a git workspace is configured.
 	// These replace the mcp-git sidecar — pure go-git, no CLI or gateway needed.
 	if os.Getenv("GIT_REPO_URL") != "" {
@@ -443,7 +433,6 @@ func runDaemon() error {
 		"providers", len(cfg.Providers),
 		"builtinTools", builtinToolCount(cfg.BuiltinTools),
 		"ociTools", len(cfg.Tools),
-		"mcpServers", len(cfg.MCPServers),
 		"fallbackModels", len(cfg.FallbackModels),
 	)
 
